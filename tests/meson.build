@@ -291,6 +291,7 @@ unit_tests = [
     'fpi-device',
     'fpi-ssm',
     'fpi-assembling',
+    'fpi-spi-transfer',
 ]
 
 if 'virtual_image' in drivers
@@ -301,6 +302,7 @@ if 'virtual_image' in drivers
 endif
 
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+unit_tests_link_args = { 'fpi-spi-transfer' : ['-Wl,--wrap=ioctl'] }
 
 foreach test_name: unit_tests
     if unit_tests_deps.has_key(test_name)
@@ -332,6 +334,7 @@ foreach test_name: unit_tests
         sources: basename + '.c',
         dependencies: [ libfprint_private_dep ] + extra_deps,
         c_args: common_cflags,
+        link_args: unit_tests_link_args.get(test_name, []),
         link_whole: test_utils,
         install: installed_tests,
         install_dir: installed_tests_execdir,

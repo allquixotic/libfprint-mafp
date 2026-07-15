@@ -44,9 +44,8 @@ typedef void (*FpiSpiTransferCallback)(FpiSpiTransfer *transfer,
  * @buffer_wr: The write buffer.
  * @buffer_rd: The read buffer.
  *
- * Helper for handling SPI transfers. Currently transfers can either be pure
- * write/read transfers or a write followed by a read (full duplex support
- * can easily be added if desired).
+ * Helper for handling SPI transfers. Transfers can be pure write/read,
+ * a write followed by a read, or a full-duplex write/read operation.
  */
 struct _FpiSpiTransfer
 {
@@ -65,6 +64,8 @@ struct _FpiSpiTransfer
   guint ref_count;
 
   int   spidev_fd;
+
+  gboolean full_duplex;
 
   /* Callbacks */
   gpointer               user_data;
@@ -98,6 +99,18 @@ void               fpi_spi_transfer_read_full (FpiSpiTransfer *transfer,
                                                guint8         *buffer,
                                                gsize           length,
                                                GDestroyNotify  free_func);
+
+void               fpi_spi_transfer_duplex (FpiSpiTransfer *transfer,
+                                             gsize           length);
+
+FP_GNUC_ACCESS (read_only, 2, 4)
+FP_GNUC_ACCESS (write_only, 3, 4)
+void               fpi_spi_transfer_duplex_full (FpiSpiTransfer *transfer,
+                                                  guint8         *buffer_wr,
+                                                  guint8         *buffer_rd,
+                                                  gsize           length,
+                                                  GDestroyNotify  free_func_wr,
+                                                  GDestroyNotify  free_func_rd);
 
 void               fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
                                             GCancellable          *cancellable,

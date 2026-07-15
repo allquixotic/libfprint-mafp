@@ -37,7 +37,8 @@ static gsize block_size = 0;
  * for the linux spidev device. The main goal are to ease memory management
  * and provide a usable asynchronous API to libfprint drivers.
  *
- * Currently only transfers with a write and subsequent read are supported.
+ * Full-duplex transfers and transfers with a write and subsequent read are
+ * supported.
  *
  * Drivers should always use this API rather than calling read/write/ioctl on
  * the spidev device.
@@ -223,6 +224,7 @@ fpi_spi_transfer_write_full (FpiSpiTransfer *transfer,
   g_return_if_fail (transfer);
 
   /* Write is always before read, so ensure both are NULL. */
+  g_return_if_fail (!transfer->full_duplex);
   g_return_if_fail (transfer->buffer_wr == NULL);
   g_return_if_fail (transfer->buffer_rd == NULL);
 
@@ -266,11 +268,71 @@ fpi_spi_transfer_read_full (FpiSpiTransfer *transfer,
 {
   g_assert (buffer != NULL);
   g_return_if_fail (transfer);
+  g_return_if_fail (!transfer->full_duplex);
   g_return_if_fail (transfer->buffer_rd == NULL);
 
   transfer->buffer_rd = buffer;
   transfer->length_rd = length;
   transfer->free_buffer_rd = free_func;
+}
+
+/**
+ * fpi_spi_transfer_duplex:
+ * @transfer: The #FpiSpiTransfer
+ * @length: The buffer size to allocate
+ *
+ * Prepare a full-duplex SPI transfer, allocating separate write and read
+ * buffers internally. Both buffers are freed automatically.
+ */
+void
+fpi_spi_transfer_duplex (FpiSpiTransfer *transfer,
+                         gsize           length)
+{
+  guint8 *buffer_wr = g_malloc0 (length);
+  guint8 *buffer_rd = g_malloc0 (length);
+
+  fpi_spi_transfer_duplex_full (transfer,
+                                buffer_wr,
+                                buffer_rd,
+                                length,
+                                g_free,
+                                g_free);
+}
+
+/**
+ * fpi_spi_transfer_duplex_full:
+ * @transfer: The #FpiSpiTransfer
+ * @buffer_wr: The data to write.
+ * @buffer_rd: Buffer to read data into.
+ * @length: The size of both buffers
+ * @free_func_wr: (destroy buffer_wr): Destroy notify for @buffer_wr
+ * @free_func_rd: (destroy buffer_rd): Destroy notify for @buffer_rd
+ *
+ * Prepare a full-duplex SPI transfer. The write and read buffers must be
+ * separate, equally sized allocations.
+ */
+void
+fpi_spi_transfer_duplex_full (FpiSpiTransfer *transfer,
+                              guint8         *buffer_wr,
+                              guint8         *buffer_rd,
+                              gsize           length,
+                              GDestroyNotify  free_func_wr,
+                              GDestroyNotify  free_func_rd)
+{
+  g_assert (buffer_wr != NULL);
+  g_assert (buffer_rd != NULL);
+  g_return_if_fail (transfer);
+  g_return_if_fail (buffer_wr != buffer_rd);
+  g_return_if_fail (transfer->buffer_wr == NULL);
+  g_return_if_fail (transfer->buffer_rd == NULL);
+
+  transfer->full_duplex = TRUE;
+  transfer->buffer_wr = buffer_wr;
+  transfer->length_wr = length;
+  transfer->free_buffer_wr = free_func_wr;
+  transfer->buffer_rd = buffer_rd;
+  transfer->length_rd = length;
+  transfer->free_buffer_rd = free_func_rd;
 }
 
 static void
@@ -299,7 +361,19 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
   int transfers = 0;
   int status;
 
-  if (transfer->buffer_wr)
+  if (transfer->full_duplex)
+    {
+      g_assert_cmpint (transfer->length_wr, ==, transfer->length_rd);
+      g_assert_cmpuint (skip, <, transfer->length_wr);
+
+      xfer[0].tx_buf = (gsize) transfer->buffer_wr + skip;
+      xfer[0].rx_buf = (gsize) transfer->buffer_rd + skip;
+      xfer[0].len = MIN (block_size, transfer->length_wr - skip);
+      len = xfer[0].len;
+      transfers = 1;
+    }
+
+  if (!transfer->full_duplex && transfer->buffer_wr)
     {
       if (skip < transfer->length_wr && len < block_size)
         {
@@ -316,7 +390,7 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
       skip -= transfer->length_wr;
     }
 
-  if (transfer->buffer_rd)
+  if (!transfer->full_duplex && transfer->buffer_rd)
     {
       if (skip < transfer->length_rd && len < block_size)
         {
@@ -340,7 +414,7 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
    * on the same bus. In practice, it is hopefully unlikely to be an issue,
    * but print a message once to help with debugging.
    */
-  if (full_length < *transferred + len)
+  if (full_length > *transferred + len)
     {
       static gboolean warned = FALSE;
 
@@ -382,11 +456,21 @@ transfer_thread_func (GTask        *task,
       return;
     }
 
-  full_length = 0;
-  if (transfer->buffer_wr)
-    full_length += transfer->length_wr;
-  if (transfer->buffer_rd)
-    full_length += transfer->length_rd;
+  if (transfer->full_duplex)
+    {
+      g_assert (transfer->buffer_wr != NULL);
+      g_assert (transfer->buffer_rd != NULL);
+      g_assert_cmpint (transfer->length_wr, ==, transfer->length_rd);
+      full_length = transfer->length_wr;
+    }
+  else
+    {
+      full_length = 0;
+      if (transfer->buffer_wr)
+        full_length += transfer->length_wr;
+      if (transfer->buffer_rd)
+        full_length += transfer->length_rd;
+    }
 
   while (transferred < full_length && status >= 0)
     status = transfer_chunk (transfer, full_length, &transferred);
