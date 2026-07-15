@@ -121,6 +121,10 @@ struct _FpiDeviceMafp8800
   /* SPI scratch buffer */
   guint8 *spi_buf;
 
+  /* asynchronous device-open state */
+  guint8 open_attempts;
+  guint8 chip_id;
+
   /* detection hysteresis state */
   gboolean detect_flag;      /* was finger detected last call */
   gint32   gray_value;       /* saved detection score */
@@ -153,6 +157,19 @@ mafp_set_reg (FpiDeviceMafp8800 *self, guint8 reg, guint8 val)
   if (ioctl (self->spi_fd, SPI_IOC_MESSAGE (1), &tr) < 0)
     return -1;
   return rx[2];
+}
+
+static FpiSpiTransfer *
+mafp_set_reg_async (FpiDeviceMafp8800 *self, guint8 reg, guint8 val)
+{
+  FpiSpiTransfer *transfer =
+    fpi_spi_transfer_new (FP_DEVICE (self), self->spi_fd);
+
+  fpi_spi_transfer_duplex (transfer, 4);
+  transfer->buffer_wr[0] = reg;
+  transfer->buffer_wr[1] = val;
+
+  return transfer;
 }
 
 static gboolean
@@ -1558,11 +1575,127 @@ mafp_dispatch (FpiDeviceMafp8800 *self, void (*func)(FpiDeviceMafp8800 *))
 
 /* FpDevice callbacks */
 
+enum mafp_open_state {
+  MAFP_OPEN_RESET,
+  MAFP_OPEN_WAIT_FOR_ID,
+  MAFP_OPEN_READ_ID,
+  MAFP_OPEN_CHECK_ID,
+  MAFP_OPEN_NUM_STATES,
+};
+
+static void
+mafp_open_read_id_cb (FpiSpiTransfer *transfer,
+                      FpDevice       *dev,
+                      gpointer        user_data,
+                      GError         *error)
+{
+  FpiDeviceMafp8800 *self = FPI_DEVICE_MAFP8800 (dev);
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (transfer->ssm, g_steal_pointer (&error));
+      return;
+    }
+
+  self->chip_id = transfer->buffer_rd[2];
+  fpi_ssm_next_state (transfer->ssm);
+}
+
+static void
+mafp_open_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceMafp8800 *self = FPI_DEVICE_MAFP8800 (dev);
+  FpiSpiTransfer *transfer;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case MAFP_OPEN_RESET:
+      transfer = mafp_set_reg_async (self, 0x8C, 0xFF);
+      transfer->ssm = ssm;
+      fpi_spi_transfer_submit (transfer,
+                               fpi_device_get_cancellable (dev),
+                               fpi_ssm_spi_transfer_cb,
+                               NULL);
+      return;
+
+    case MAFP_OPEN_WAIT_FOR_ID:
+      fpi_ssm_next_state_delayed (ssm, 1);
+      return;
+
+    case MAFP_OPEN_READ_ID:
+      transfer = mafp_set_reg_async (self, 0x04, 0x00);
+      transfer->ssm = ssm;
+      fpi_spi_transfer_submit (transfer,
+                               fpi_device_get_cancellable (dev),
+                               mafp_open_read_id_cb,
+                               NULL);
+      return;
+
+    case MAFP_OPEN_CHECK_ID:
+      if (self->chip_id == MAFP_CHIPID_FP36)
+        {
+          fp_info ("detected FP36 chip ID 0x%02x", self->chip_id);
+          fpi_ssm_mark_completed (ssm);
+          return;
+        }
+
+      self->open_attempts++;
+      if (self->open_attempts >= 20)
+        {
+          fpi_ssm_mark_failed (ssm,
+                               fpi_device_error_new_msg (
+                                 FP_DEVICE_ERROR_PROTO,
+                                 "FP36 did not respond with chip ID 0x%02x "
+                                 "(last response 0x%02x)",
+                                 MAFP_CHIPID_FP36,
+                                 self->chip_id));
+          return;
+        }
+
+      fpi_ssm_jump_to_state (ssm, MAFP_OPEN_WAIT_FOR_ID);
+      return;
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+static void
+mafp_open_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceMafp8800 *self = FPI_DEVICE_MAFP8800 (dev);
+
+  if (error)
+    {
+      close (self->spi_fd);
+      self->spi_fd = -1;
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
+  /* Allocate buffers */
+  self->bg_frame   = g_malloc0 (MAFP_FRAME_BYTES);
+  self->cur_frame  = g_malloc0 (MAFP_FRAME_BYTES);
+  self->stab_frame = g_malloc0 (MAFP_FRAME_BYTES);
+  self->detect_ref = g_malloc0 (MAFP_FRAME_BYTES);
+  self->enhanced   = g_new0 (guint16, MAFP_ENHANCED_PIXELS);
+  self->spi_buf    = g_malloc0 (MAFP_RAW_READ_SZ);
+
+  /* Start worker */
+  g_mutex_init (&self->lock);
+  g_cond_init (&self->cond);
+  self->exit_flag = FALSE;
+  self->worker = g_thread_new ("mafp", mafp_worker, self);
+
+  fpi_device_open_complete (dev, NULL);
+}
+
 static void
 mafp_open (FpDevice *dev)
 {
   FpiDeviceMafp8800 *self = FPI_DEVICE_MAFP8800 (dev);
   const char *path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+  FpiSsm *ssm;
 
   fp_info ("opening %s", path ? path : "(null)");
 
@@ -1582,50 +1715,12 @@ mafp_open (FpDevice *dev)
       return;
     }
 
-  guint8 mode = SPI_MODE_0;
-  guint8 bpw = 8;
-  guint32 speed = MAFP_SPI_SPEED;
-  ioctl (self->spi_fd, SPI_IOC_WR_MODE, &mode);
-  ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bpw);
-  ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
-
-  /* Verify chip */
-  if (!mafp_fp36_reset (self))
-    {
-      close (self->spi_fd);
-      self->spi_fd = -1;
-      fpi_device_open_complete (dev,
-                                fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO, "chip not responding"));
-      return;
-    }
-
-  gint id = mafp_set_reg (self, 0x04, 0x00);
-  fp_info ("chip ID=0x%02x", id);
-  if (id != MAFP_CHIPID_FP36)
-    {
-      close (self->spi_fd);
-      self->spi_fd = -1;
-      fpi_device_open_complete (dev,
-                                fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
-                                                          "unsupported chip 0x%02x", id));
-      return;
-    }
-
-  /* Allocate buffers */
-  self->bg_frame   = g_malloc0 (MAFP_FRAME_BYTES);
-  self->cur_frame  = g_malloc0 (MAFP_FRAME_BYTES);
-  self->stab_frame = g_malloc0 (MAFP_FRAME_BYTES);
-  self->detect_ref = g_malloc0 (MAFP_FRAME_BYTES);
-  self->enhanced   = g_new0 (guint16, MAFP_ENHANCED_PIXELS);
-  self->spi_buf    = g_malloc0 (MAFP_RAW_READ_SZ);
-
-  /* Start worker */
-  g_mutex_init (&self->lock);
-  g_cond_init (&self->cond);
-  self->exit_flag = FALSE;
-  self->worker = g_thread_new ("mafp", mafp_worker, self);
-
-  fpi_device_open_complete (dev, NULL);
+  /* Mode, word size, and maximum speed come from the ACPI SpiSerialBus
+   * descriptor. All data traffic goes through FpiSpiTransfer. */
+  self->open_attempts = 0;
+  self->chip_id = 0;
+  ssm = fpi_ssm_new (dev, mafp_open_handler, MAFP_OPEN_NUM_STATES);
+  fpi_ssm_start (ssm, mafp_open_complete);
 }
 
 static void
