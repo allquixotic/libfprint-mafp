@@ -1,0 +1,10 @@
+# GLib's shared GThreadPool queue is implemented inside the uninstrumented
+# system libglib.  TSan cannot observe its internal synchronization and reports
+# the queue-node handoff from g_task_run_in_thread() as a race.  Keep this
+# suppression limited to the GLib queue-pop symbol; reports in libfprint or the
+# MAFP8800 driver must remain visible.
+race:^g_queue_pop_tail$
+# GTask/GObject also hands callback closure ownership to the worker pool using
+# GLib atomics that are invisible to an executable-only TSan build.
+race:^g_closure_unref$
+race:^g_signal_handlers_disconnect_matched$

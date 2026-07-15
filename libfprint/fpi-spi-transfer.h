@@ -26,8 +26,8 @@ G_BEGIN_DECLS
 
 #define FPI_TYPE_SPI_TRANSFER (fpi_spi_transfer_get_type ())
 
+struct _FpiSsm;
 typedef struct _FpiSpiTransfer FpiSpiTransfer;
-typedef struct _FpiSsm         FpiSsm;
 
 typedef void (*FpiSpiTransferCallback)(FpiSpiTransfer *transfer,
                                        FpDevice       *dev,
@@ -50,20 +50,25 @@ typedef void (*FpiSpiTransferCallback)(FpiSpiTransfer *transfer,
 struct _FpiSpiTransfer
 {
   /*< public >*/
-  FpDevice *device;
+  FpDevice       *device;
 
-  FpiSsm   *ssm;
+  struct _FpiSsm *ssm;
 
-  gssize    length_wr;
-  gssize    length_rd;
+  gssize          length_wr;
+  gssize          length_rd;
 
-  guchar   *buffer_wr;
-  guchar   *buffer_rd;
+  guchar         *buffer_wr;
+  guchar         *buffer_rd;
 
   /*< private >*/
   guint ref_count;
 
-  int   spidev_fd;
+  /* Explicit publication barriers around the GTask worker handoff.  These
+   * also document that no transfer fields may be mutated while submitted. */
+  gint     submitted;
+  gint     worker_complete;
+
+  int      spidev_fd;
 
   gboolean full_duplex;
 
@@ -101,16 +106,16 @@ void               fpi_spi_transfer_read_full (FpiSpiTransfer *transfer,
                                                GDestroyNotify  free_func);
 
 void               fpi_spi_transfer_duplex (FpiSpiTransfer *transfer,
-                                             gsize           length);
+                                            gsize           length);
 
 FP_GNUC_ACCESS (read_only, 2, 4)
 FP_GNUC_ACCESS (write_only, 3, 4)
 void               fpi_spi_transfer_duplex_full (FpiSpiTransfer *transfer,
-                                                  guint8         *buffer_wr,
-                                                  guint8         *buffer_rd,
-                                                  gsize           length,
-                                                  GDestroyNotify  free_func_wr,
-                                                  GDestroyNotify  free_func_rd);
+                                                 guint8         *buffer_wr,
+                                                 guint8         *buffer_rd,
+                                                 gsize           length,
+                                                 GDestroyNotify  free_func_wr,
+                                                 GDestroyNotify  free_func_rd);
 
 void               fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
                                             GCancellable          *cancellable,

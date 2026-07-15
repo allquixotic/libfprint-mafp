@@ -100,26 +100,29 @@ fpi_spi_transfer_new (FpDevice * device, int spidev_fd)
 
   g_assert (FP_IS_DEVICE (device));
 
-  if (G_UNLIKELY (block_size == 0))
+  if (g_once_init_enter (&block_size))
     {
       g_autoptr(GError) error = NULL;
       g_autofree char *contents = NULL;
-
-      block_size = SPIDEV_BLOCK_SIZE_FALLBACK;
+      gsize detected_block_size = SPIDEV_BLOCK_SIZE_FALLBACK;
 
       if (g_file_get_contents (SPIDEV_BLOCK_SIZE_PARAM, &contents, NULL, &error))
         {
-          block_size = MIN (g_ascii_strtoull (contents, NULL, 0), G_MAXUINT16);
-          if (block_size == 0)
+          detected_block_size = MIN (g_ascii_strtoull (contents, NULL, 0), G_MAXUINT16);
+          if (detected_block_size == 0)
             {
-              block_size = SPIDEV_BLOCK_SIZE_FALLBACK;
-              g_warning ("spidev blocksize could not be decoded, using %" G_GSIZE_FORMAT, block_size);
+              detected_block_size = SPIDEV_BLOCK_SIZE_FALLBACK;
+              g_warning ("spidev blocksize could not be decoded, using %" G_GSIZE_FORMAT,
+                         detected_block_size);
             }
         }
       else
         {
-          g_message ("Failed to read spidev block size, using %" G_GSIZE_FORMAT, block_size);
+          g_message ("Failed to read spidev block size, using %" G_GSIZE_FORMAT,
+                     detected_block_size);
         }
+
+      g_once_init_leave (&block_size, detected_block_size);
     }
 
   self = g_slice_new0 (FpiSpiTransfer);
@@ -343,12 +346,18 @@ transfer_finish_cb (GObject *source_object, GAsyncResult *res, gpointer user_dat
   GError *error = NULL;
   FpiSpiTransferCallback callback;
 
+  /* Acquire all writes made by transfer_thread_func() before inspecting the
+   * result buffers or invoking driver code. */
+  g_assert_cmpint (g_atomic_int_get (&transfer->worker_complete), ==, 1);
+
   g_task_propagate_boolean (task, &error);
 
   log_transfer (transfer, FALSE, error);
 
   callback = transfer->callback;
   transfer->callback = NULL;
+  g_atomic_int_set (&transfer->worker_complete, 0);
+  g_atomic_int_set (&transfer->submitted, 0);
   callback (transfer, transfer->device, transfer->user_data, error);
 }
 
@@ -372,11 +381,12 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
       len = xfer[0].len;
       transfers = 1;
     }
-
-  if (!transfer->full_duplex && transfer->buffer_wr)
+  else
     {
-      if (skip < transfer->length_wr && len < block_size)
+      if (transfer->buffer_wr &&
+          skip < transfer->length_wr && len < block_size)
         {
+          g_assert_cmpuint (transfers, <, G_N_ELEMENTS (xfer));
           xfer[transfers].tx_buf = (gsize) transfer->buffer_wr + skip;
           xfer[transfers].len = MIN (block_size, transfer->length_wr - skip);
 
@@ -386,14 +396,20 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
           transfers += 1;
         }
 
-      /* How much we need to skip in the next transfer. */
-      skip -= transfer->length_wr;
-    }
-
-  if (!transfer->full_duplex && transfer->buffer_rd)
-    {
-      if (skip < transfer->length_rd && len < block_size)
+      if (transfer->buffer_wr)
         {
+          /* A partially transferred write means the read phase cannot start
+           * in this chunk.  Avoid relying on unsigned underflow to encode
+           * that state. */
+          skip = skip >= transfer->length_wr ?
+                 skip - transfer->length_wr :
+                 G_MAXSIZE;
+        }
+
+      if (transfer->buffer_rd &&
+          skip < transfer->length_rd && len < block_size)
+        {
+          g_assert_cmpuint (transfers, <, G_N_ELEMENTS (xfer));
           xfer[transfers].rx_buf = (gsize) transfer->buffer_rd + skip;
           xfer[transfers].len = MIN (block_size, transfer->length_rd - skip);
 
@@ -402,9 +418,6 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
 
           transfers += 1;
         }
-
-      /* How much we need to skip in the next transfer. */
-      /* skip -= transfer->length_rd; */
     }
 
   g_assert (transfers > 0);
@@ -447,8 +460,13 @@ transfer_thread_func (GTask        *task,
   gsize transferred = 0;
   int status = 0;
 
+  /* Pair with the release in fpi_spi_transfer_submit().  GTask owns the
+   * transfer after submission; callers must not mutate it until completion. */
+  g_assert_cmpint (g_atomic_int_get (&transfer->submitted), ==, 1);
+
   if (transfer->buffer_wr == NULL && transfer->buffer_rd == NULL)
     {
+      g_atomic_int_set (&transfer->worker_complete, 1);
       g_task_return_new_error (task,
                                G_IO_ERROR,
                                G_IO_ERROR_INVALID_ARGUMENT,
@@ -476,11 +494,22 @@ transfer_thread_func (GTask        *task,
     {
       /* An ioctl in progress cannot be interrupted, but cancellation must
        * prevent additional chunks from being submitted. */
-      if (g_task_return_error_if_cancelled (task))
-        return;
+      if (cancellable && g_cancellable_is_cancelled (cancellable))
+        {
+          g_atomic_int_set (&transfer->worker_complete, 1);
+          g_task_return_new_error (task,
+                                   G_IO_ERROR,
+                                   G_IO_ERROR_CANCELLED,
+                                   "SPI transfer was cancelled");
+          return;
+        }
 
       status = transfer_chunk (transfer, full_length, &transferred);
     }
+
+  /* Publish ioctl output and all other worker writes before GTask schedules
+   * the completion callback on the originating main context. */
+  g_atomic_int_set (&transfer->worker_complete, 1);
 
   if (status < 0)
     {
@@ -528,6 +557,8 @@ fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
 
   transfer->callback = callback;
   transfer->user_data = user_data;
+  g_assert_cmpint (g_atomic_int_get (&transfer->submitted), ==, 0);
+  g_assert_cmpint (g_atomic_int_get (&transfer->worker_complete), ==, 0);
 
   log_transfer (transfer, TRUE, NULL);
 
@@ -535,6 +566,8 @@ fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
                      cancellable,
                      transfer_finish_cb,
                      NULL);
+  /* Publish all initialized fields before handing ownership to GTask. */
+  g_atomic_int_set (&transfer->submitted, 1);
   g_task_set_task_data (task,
                         g_steal_pointer (&transfer),
                         (GDestroyNotify) fpi_spi_transfer_unref);

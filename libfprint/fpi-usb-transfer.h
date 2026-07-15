@@ -30,8 +30,8 @@ G_BEGIN_DECLS
 #define FPI_USB_ENDPOINT_IN 0x80
 #define FPI_USB_ENDPOINT_OUT 0x00
 
+struct _FpiSsm;
 typedef struct _FpiUsbTransfer FpiUsbTransfer;
-typedef struct _FpiSsm         FpiSsm;
 
 typedef void (*FpiUsbTransferCallback)(FpiUsbTransfer *transfer,
                                        FpDevice       *dev,
@@ -69,14 +69,14 @@ typedef enum  {
 struct _FpiUsbTransfer
 {
   /*< public >*/
-  FpDevice *device;
+  FpDevice       *device;
 
-  FpiSsm   *ssm;
+  struct _FpiSsm *ssm;
 
-  gssize    length;
-  gssize    actual_length;
+  gssize          length;
+  gssize          actual_length;
 
-  guchar   *buffer;
+  guchar         *buffer;
 
   /*< private >*/
   guint ref_count;
