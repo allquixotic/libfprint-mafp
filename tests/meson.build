@@ -292,6 +292,7 @@ unit_tests = [
     'fpi-ssm',
     'fpi-assembling',
     'fpi-spi-transfer',
+    'fpi-mafp8800-proto',
 ]
 
 if 'virtual_image' in drivers
@@ -303,6 +304,12 @@ endif
 
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
 unit_tests_link_args = { 'fpi-spi-transfer' : ['-Wl,--wrap=ioctl'] }
+unit_tests_sources = {
+    'fpi-mafp8800-proto': files(
+        'test-fpi-mafp8800-proto.c',
+        '../libfprint/drivers/mafp8800-proto.c',
+    ),
+}
 
 foreach test_name: unit_tests
     if unit_tests_deps.has_key(test_name)
@@ -331,7 +338,7 @@ foreach test_name: unit_tests
 
     basename = 'test-' + test_name
     test_exe = executable(basename,
-        sources: basename + '.c',
+        sources: unit_tests_sources.get(test_name, files(basename + '.c')),
         dependencies: [ libfprint_private_dep ] + extra_deps,
         c_args: common_cflags,
         link_args: unit_tests_link_args.get(test_name, []),

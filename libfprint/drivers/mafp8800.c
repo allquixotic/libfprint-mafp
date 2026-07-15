@@ -31,6 +31,7 @@
 #define FP_COMPONENT "mafp8800"
 
 #include "drivers_api.h"
+#include "mafp8800-proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -41,17 +42,17 @@
 #include <linux/spi/spidev.h>
 
 /* Image geometry: 160 rows x 37 pixels, 74 bytes/row (2 hdr + 72 pixel) */
-#define MAFP_ROWS 160
-#define MAFP_COLS 37
-#define MAFP_ROW_BYTES 74              /* 0x4A */
+#define MAFP_ROWS MAFP8800_FP36_ROWS
+#define MAFP_COLS MAFP8800_FP36_COLUMNS
+#define MAFP_ROW_BYTES MAFP8800_FP36_ROW_SIZE
 #define MAFP_PIXELS (MAFP_ROWS * MAFP_COLS)            /* 5920 */
-#define MAFP_FRAME_BYTES (320 * MAFP_ROW_BYTES)        /* 0x5C80 = 23680 */
+#define MAFP_FRAME_BYTES MAFP8800_FP36_FRAME_SIZE
 #define MAFP_ENHANCED_COLS 36          /* column 0 stripped */
 #define MAFP_ENHANCED_PIXELS (MAFP_ROWS * MAFP_ENHANCED_COLS)   /* 5760 */
 
 /* SPI */
 #define MAFP_SPI_SPEED 4000000
-#define MAFP_RAW_READ_SZ 20480         /* 0x5000 */
+#define MAFP_RAW_READ_SZ MAFP8800_FP36_RAW_SIZE
 
 /* Chip ID */
 #define MAFP_CHIPID_FP36 0x24
@@ -109,7 +110,7 @@ struct _FpiDeviceMafp8800
   /* calibration data (loaded from file or computed) */
   guint8 calib[MAFP_CALIB_SZ];
 
-  /* image buffers (each MAFP_FRAME_BYTES = 23680 bytes of u16 in LE) */
+  /* image buffers (160 * 37 pixels as u16 in LE) */
   guint8 *bg_frame;          /* background/image_data reference */
   guint8 *cur_frame;         /* current capture */
   guint8 *stab_frame;        /* stability reference */
@@ -232,6 +233,8 @@ static int
 mafp_fp36_read_image (FpiDeviceMafp8800 *self, guint8 *out_frame)
 {
   guint8 *buf = self->spi_buf;
+  g_autoptr(GError) error = NULL;
+  guint rows = 0;
 
   memset (buf, 0xFF, MAFP_RAW_READ_SZ);
   buf[0] = 0x70;
@@ -239,35 +242,14 @@ mafp_fp36_read_image (FpiDeviceMafp8800 *self, guint8 *out_frame)
   if (!mafp_spi_read_data (self, buf, MAFP_RAW_READ_SZ))
     return 0;
 
-  /* Scan for row markers and pack rows into out_frame */
-  int rows = 0;
-  int i = 0;
-
-  while (i < MAFP_RAW_READ_SZ - 4 && rows < MAFP_ROWS)
-    {
-      if (buf[i] == 0x00 && buf[i + 1] == 0x00 &&
-          buf[i + 2] == 0x0A && (buf[i + 3] & 0xF0) == 0x50)
-        {
-          int src = i + 4;
-          if (src + MAFP_ROW_BYTES > MAFP_RAW_READ_SZ)
-            break;
-          memcpy (out_frame + rows * MAFP_ROW_BYTES, buf + src, MAFP_ROW_BYTES);
-          rows++;
-          i = src + MAFP_ROW_BYTES;
-        }
-      else
-        {
-          i++;
-        }
-    }
-
-  /* Byte-swap: big-endian to little-endian u16 in-place */
-  for (int j = 0; j < rows * MAFP_ROW_BYTES; j += 2)
-    {
-      guint8 tmp = out_frame[j];
-      out_frame[j] = out_frame[j + 1];
-      out_frame[j + 1] = tmp;
-    }
+  if (!mafp8800_parse_fp36_rows (buf,
+                                 MAFP_RAW_READ_SZ,
+                                 out_frame,
+                                 MAFP_FRAME_BYTES,
+                                 MAFP_ROWS,
+                                 &rows,
+                                 &error))
+    fp_warn ("Failed to decode FP36 frame: %s", error->message);
 
   return rows;
 }

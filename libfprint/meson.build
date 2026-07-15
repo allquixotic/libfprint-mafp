@@ -122,7 +122,10 @@ driver_sources = {
     'elan' : files('drivers/elan.c'),
     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
     'elanspi' : files('drivers/elanspi.c'),
-    'mafp8800' : files('drivers/mafp8800.c'),
+    'mafp8800' : files(
+        'drivers/mafp8800.c',
+        'drivers/mafp8800-proto.c',
+    ),
     'nb1010' : files('drivers/nb1010.c'),
     'virtual_image' : files('drivers/virtual-image.c'),
     'virtual_device' : files('drivers/virtual-device.c'),
