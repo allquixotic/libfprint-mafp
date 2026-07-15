@@ -22,20 +22,23 @@
 typedef struct
 {
   GMainLoop *loop;
-  gboolean   expect_error;
+  gint        expected_error;
 } TransferTestData;
 
 typedef struct
 {
   gsize    length;
-  gboolean expect_error;
+  gint     expected_error;
   gboolean expect_split;
+  gboolean cancel_after_first;
 } TransferTestParams;
 
 static gboolean ioctl_error;
 static guint ioctl_calls;
 static gsize expected_length;
 static gsize transferred_length;
+static gboolean cancel_after_first;
+static GCancellable *active_cancellable;
 
 int __wrap_ioctl (int fd, unsigned long request, ...);
 
@@ -73,6 +76,9 @@ __wrap_ioctl (int fd, unsigned long request, ...)
     buffer_rd[i] = buffer_wr[i] ^ TEST_MASK;
   transferred_length += xfer[0].len;
 
+  if (cancel_after_first && ioctl_calls == 1)
+    g_cancellable_cancel (active_cancellable);
+
   return xfer[0].len;
 }
 
@@ -87,8 +93,8 @@ transfer_done_cb (FpiSpiTransfer *transfer,
   g_assert_true (FP_IS_DEVICE (device));
   g_assert_nonnull (transfer);
 
-  if (data->expect_error)
-    g_assert_error (error, G_IO_ERROR, G_IO_ERROR_FAILED);
+  if (data->expected_error >= 0)
+    g_assert_error (error, G_IO_ERROR, data->expected_error);
   else
     {
       g_assert_no_error (error);
@@ -107,16 +113,19 @@ test_duplex_async (gconstpointer user_data)
   const TransferTestParams *params = user_data;
   g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
   g_autoptr(FpiSpiTransfer) transfer = NULL;
+  g_autoptr(GCancellable) cancellable = g_cancellable_new ();
   g_autoptr(GMainLoop) loop = g_main_loop_new (NULL, FALSE);
   TransferTestData data = {
     .loop = loop,
-    .expect_error = params->expect_error,
+    .expected_error = params->expected_error,
   };
 
-  ioctl_error = data.expect_error;
+  ioctl_error = data.expected_error == G_IO_ERROR_FAILED;
   ioctl_calls = 0;
   expected_length = params->length;
   transferred_length = 0;
+  cancel_after_first = params->cancel_after_first;
+  active_cancellable = cancellable;
 
   transfer = fpi_spi_transfer_new (device, TEST_FD);
   fpi_spi_transfer_duplex (transfer, params->length);
@@ -126,12 +135,16 @@ test_duplex_async (gconstpointer user_data)
   transfer->buffer_wr[3] = 0x08;
 
   fpi_spi_transfer_submit (g_steal_pointer (&transfer),
-                           NULL,
+                           cancellable,
                            transfer_done_cb,
                            &data);
   g_main_loop_run (loop);
 
-  if (params->expect_split)
+  active_cancellable = NULL;
+
+  if (params->cancel_after_first)
+    g_assert_cmpuint (ioctl_calls, ==, 1);
+  else if (params->expect_split)
     g_assert_cmpuint (ioctl_calls, >, 1);
   else
     g_assert_cmpuint (ioctl_calls, ==, 1);
@@ -142,14 +155,21 @@ main (int argc, char *argv[])
 {
   static const TransferTestParams success = {
     .length = 4,
+    .expected_error = -1,
   };
   static const TransferTestParams split = {
     .length = (gsize) G_MAXUINT16 + 1,
+    .expected_error = -1,
     .expect_split = TRUE,
   };
   static const TransferTestParams error = {
     .length = 4,
-    .expect_error = TRUE,
+    .expected_error = G_IO_ERROR_FAILED,
+  };
+  static const TransferTestParams cancel = {
+    .length = (gsize) G_MAXUINT16 + 1,
+    .expected_error = G_IO_ERROR_CANCELLED,
+    .cancel_after_first = TRUE,
   };
 
   g_test_init (&argc, &argv, NULL);
@@ -162,6 +182,9 @@ main (int argc, char *argv[])
                         test_duplex_async);
   g_test_add_data_func ("/spi-transfer/duplex/async/error",
                         &error,
+                        test_duplex_async);
+  g_test_add_data_func ("/spi-transfer/duplex/async/cancel-between-chunks",
+                        &cancel,
                         test_duplex_async);
 
   return g_test_run ();

@@ -293,6 +293,7 @@ unit_tests = [
     'fpi-assembling',
     'fpi-spi-transfer',
     'fpi-mafp8800-proto',
+    'fpi-mafp8800-transport',
 ]
 
 if 'virtual_image' in drivers
@@ -303,11 +304,19 @@ if 'virtual_image' in drivers
 endif
 
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
-unit_tests_link_args = { 'fpi-spi-transfer' : ['-Wl,--wrap=ioctl'] }
+unit_tests_link_args = {
+    'fpi-spi-transfer' : ['-Wl,--wrap=ioctl'],
+    'fpi-mafp8800-transport' : ['-Wl,--wrap=ioctl'],
+}
 unit_tests_sources = {
     'fpi-mafp8800-proto': files(
         'test-fpi-mafp8800-proto.c',
         '../libfprint/drivers/mafp8800-proto.c',
+    ),
+    'fpi-mafp8800-transport': files(
+        'test-fpi-mafp8800-transport.c',
+        '../libfprint/drivers/mafp8800-proto.c',
+        '../libfprint/drivers/mafp8800-transport.c',
     ),
 }
 

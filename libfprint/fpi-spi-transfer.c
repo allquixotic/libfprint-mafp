@@ -473,7 +473,14 @@ transfer_thread_func (GTask        *task,
     }
 
   while (transferred < full_length && status >= 0)
-    status = transfer_chunk (transfer, full_length, &transferred);
+    {
+      /* An ioctl in progress cannot be interrupted, but cancellation must
+       * prevent additional chunks from being submitted. */
+      if (g_task_return_error_if_cancelled (task))
+        return;
+
+      status = transfer_chunk (transfer, full_length, &transferred);
+    }
 
   if (status < 0)
     {
