@@ -28,13 +28,43 @@ typedef struct
   gboolean   complete;
 } CaptureResult;
 
+typedef struct
+{
+  GCancellable *cancellable;
+  GMainLoop    *loop;
+  gboolean      prompting;
+} CaptureControl;
+
 static gboolean
 cancel_capture (gpointer user_data)
 {
-  GCancellable *cancellable = user_data;
+  CaptureControl *control = user_data;
 
-  g_cancellable_cancel (cancellable);
-  return G_SOURCE_REMOVE;
+  g_cancellable_cancel (control->cancellable);
+  if (control->prompting)
+    g_main_loop_quit (control->loop);
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+confirm_finger (gint fd, GIOCondition condition, gpointer user_data)
+{
+  CaptureResult *result = user_data;
+  char input[128];
+  ssize_t count = -1;
+
+  if (condition & G_IO_IN)
+    count = read (fd, input, sizeof (input));
+
+  if (count > 0)
+    result->complete = TRUE;
+  else
+    result->error = g_error_new_literal (G_IO_ERROR,
+                                         G_IO_ERROR_CANCELLED,
+                                         "No confirmation received");
+
+  g_main_loop_quit (result->loop);
+  return G_SOURCE_CONTINUE;
 }
 
 static void
@@ -142,7 +172,9 @@ main (int argc, char *argv[])
   g_autofree guint16 *enhanced = NULL;
   g_autoptr(GError) error = NULL;
   CaptureResult result = { 0 };
+  CaptureControl control = { 0 };
   FpiSsm *ssm;
+  guint input_source = 0;
   guint signal_source;
   guint timeout_source;
   guint8 gain = 0;
@@ -172,6 +204,8 @@ main (int argc, char *argv[])
   background = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
   enhanced = g_new0 (guint16, MAFP8800_FP36_ENHANCED_PIXELS);
   result.loop = loop;
+  control.cancellable = cancellable;
+  control.loop = loop;
   g_object_set_data (G_OBJECT (device), "mafp-capture-result", &result);
 
   ssm = mafp8800_fp36_calibrate_gain_new (device,
@@ -182,10 +216,10 @@ main (int argc, char *argv[])
 
   signal_source = g_unix_signal_add (SIGINT,
                                      cancel_capture,
-                                     cancellable);
+                                     &control);
   timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
                                           cancel_capture,
-                                          cancellable);
+                                          &control);
 
   fpi_ssm_start (ssm, capture_complete_cb);
   if (!result.complete)
@@ -198,7 +232,7 @@ main (int argc, char *argv[])
       result.complete = FALSE;
       timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
                                               cancel_capture,
-                                              cancellable);
+                                              &control);
       ssm = mafp8800_fp36_capture_new (device,
                                        spi_fd,
                                        cancellable,
@@ -220,10 +254,20 @@ main (int argc, char *argv[])
       g_print ("Background captured. Place one finger flat on the reader, "
                "then press Enter (Ctrl+C cancels): ");
       fflush (stdout);
-      if (getchar () == EOF)
+      result.complete = FALSE;
+      control.prompting = TRUE;
+      input_source = g_unix_fd_add (STDIN_FILENO,
+                                    G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+                                    confirm_finger,
+                                    &result);
+      g_main_loop_run (loop);
+      control.prompting = FALSE;
+      g_clear_handle_id (&input_source, g_source_remove);
+
+      if (!result.error && g_cancellable_is_cancelled (cancellable))
         result.error = g_error_new_literal (G_IO_ERROR,
                                             G_IO_ERROR_CANCELLED,
-                                            "No confirmation received");
+                                            "Capture cancelled");
     }
 
   if (!result.error && finger_mode)
@@ -231,7 +275,7 @@ main (int argc, char *argv[])
       result.complete = FALSE;
       timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
                                               cancel_capture,
-                                              cancellable);
+                                              &control);
       ssm = mafp8800_fp36_capture_new (device,
                                        spi_fd,
                                        cancellable,
@@ -258,6 +302,7 @@ main (int argc, char *argv[])
     }
 
   g_clear_handle_id (&signal_source, g_source_remove);
+  g_clear_handle_id (&input_source, g_source_remove);
   g_clear_handle_id (&timeout_source, g_source_remove);
   close (spi_fd);
 
