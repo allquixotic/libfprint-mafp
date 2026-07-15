@@ -307,6 +307,7 @@ unit_tests = [
     'fpi-assembling',
     'fpi-spi-transfer',
     'fpi-mafp8800-proto',
+    'fpi-mafp8800-template',
     'fpi-mafp8800-transport',
 ]
 
@@ -326,6 +327,10 @@ unit_tests_sources = {
     'fpi-mafp8800-proto': files(
         'test-fpi-mafp8800-proto.c',
         '../libfprint/drivers/mafp8800-proto.c',
+    ),
+    'fpi-mafp8800-template': files(
+        'test-fpi-mafp8800-template.c',
+        '../libfprint/drivers/mafp8800-template.c',
     ),
     'fpi-mafp8800-transport': files(
         'test-fpi-mafp8800-transport.c',

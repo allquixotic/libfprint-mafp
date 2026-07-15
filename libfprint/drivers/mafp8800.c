@@ -32,6 +32,7 @@
 
 #include "drivers_api.h"
 #include "mafp8800-proto.h"
+#include "mafp8800-template.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -63,22 +64,22 @@
 #define MAFP_STABLE_SAD_LIMIT 114687   /* 0x1C1FF: sum-of-abs-diffs for "stable" */
 
 /* Enrollment */
-#define MAFP_ENROLL_STAGES 8
+#define MAFP_ENROLL_STAGES MAFP8800_TEMPLATE_MAX_SAMPLES
 
 /* Gaussian pyramid: 5 levels (original + 4 blurs), 4 DoG layers */
 #define MAFP_PYR_LEVELS 5
 #define MAFP_DOG_LEVELS 4
 
 /* Template geometry: 2 banks × 50 keypoints × 20 bytes + headers */
-#define MAFP_MAX_KP 50               /* max keypoints per bank */
-#define MAFP_NUM_BANKS 2
-#define MAFP_DESC_BYTES 16           /* 128-bit binary descriptor */
-#define MAFP_KP_META 4               /* row(u8) + col(u8) + orientation(u16) */
-#define MAFP_KP_SIZE (MAFP_DESC_BYTES + MAFP_KP_META)           /* 20 */
-#define MAFP_BANK_DATA_SZ (MAFP_MAX_KP * MAFP_KP_SIZE)      /* 1000 */
-#define MAFP_BANK_SZ (4 + MAFP_BANK_DATA_SZ)           /* 1004 */
-#define MAFP_TPL_MAGIC 0xEF
-#define MAFP_TPL_SAMPLE_SZ (4 + MAFP_NUM_BANKS * MAFP_BANK_SZ)    /* 2012 */
+#define MAFP_MAX_KP MAFP8800_TEMPLATE_MAX_KEYPOINTS
+#define MAFP_NUM_BANKS MAFP8800_TEMPLATE_BANKS
+#define MAFP_DESC_BYTES MAFP8800_TEMPLATE_DESCRIPTOR_SIZE
+#define MAFP_KP_META MAFP8800_TEMPLATE_KEYPOINT_META_SIZE
+#define MAFP_KP_SIZE MAFP8800_TEMPLATE_KEYPOINT_SIZE
+#define MAFP_BANK_DATA_SZ MAFP8800_TEMPLATE_BANK_DATA_SIZE
+#define MAFP_BANK_SZ MAFP8800_TEMPLATE_BANK_SIZE
+#define MAFP_TPL_MAGIC MAFP8800_TEMPLATE_SAMPLE_MAGIC
+#define MAFP_TPL_SAMPLE_SZ MAFP8800_TEMPLATE_SAMPLE_SIZE
 
 /* Match scoring */
 #define MAFP_MATCH_THRESH 3000       /* 0xBB8: score >= this = match */
@@ -93,8 +94,8 @@
 #define MAFP_MAX_KP_TOTAL 100       /* max keypoints across both DoG layers */
 
 /* Template buffer: header + 8 enrollment samples */
-#define MAFP_TPL_HDR_SZ 4
-#define MAFP_TPL_BUF_SZ (MAFP_TPL_HDR_SZ + MAFP_ENROLL_STAGES * MAFP_TPL_SAMPLE_SZ)
+#define MAFP_TPL_HDR_SZ MAFP8800_TEMPLATE_HEADER_SIZE
+#define MAFP_TPL_BUF_SZ MAFP8800_TEMPLATE_SIZE
 
 /* Calibration file */
 #define MAFP_CALIB_PATH "/var/lib/fprint/mafp_calibration"
@@ -233,6 +234,7 @@ static int
 mafp_fp36_read_image (FpiDeviceMafp8800 *self, guint8 *out_frame)
 {
   guint8 *buf = self->spi_buf;
+
   g_autoptr(GError) error = NULL;
   guint rows = 0;
 
@@ -590,7 +592,8 @@ mafp_compute_gradients (const guint16 *img, int rows, int cols,
       {
         gint32 gx = (gint32) img[r * cols + c + 1] - (gint32) img[r * cols + c - 1];
         gint32 gy = (gint32) img[(r + 1) * cols + c] - (gint32) img[(r - 1) * cols + c];
-        mag[r * cols + c] = (gint32) sqrt ((double) (gx * gx + gy * gy));
+        mag[r * cols + c] =
+          (gint32) sqrt ((double) gx * gx + (double) gy * gy);
         gdouble a = atan2 ((double) gy, (double) gx);
         if (a < 0)
           a += 2.0 * G_PI;
@@ -605,7 +608,7 @@ typedef struct
   guint8  col;
   guint8  dog_layer;
   guint8  polarity;    /* 0 = DoG maximum, 1 = DoG minimum */
-  gint16  response;    /* absolute value of DoG extremum */
+  guint16 response;    /* absolute value of DoG extremum */
   gdouble orientation;
   guint8  desc[MAFP_DESC_BYTES];
 } MafpKeypoint;
@@ -705,7 +708,8 @@ mafp_detect_keypoints (gint16 **dog, MafpKeypoint *kps)
               kps[count].col       = (guint8) c;
               kps[count].dog_layer = (guint8) layer;
               kps[count].polarity  = is_min ? 1 : 0;
-              kps[count].response  = is_min ? -val : val;
+              kps[count].response  = is_min ? (guint16) (-(gint32) val) :
+                                     (guint16) val;
               count++;
             }
         }
@@ -954,7 +958,11 @@ mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
   /* DoG = adjacent level difference */
   for (int l = 0; l < MAFP_DOG_LEVELS; l++)
     for (int i = 0; i < N; i++)
-      dog[l][i] = (gint16) pyr[l][i] - (gint16) pyr[l + 1][i];
+      {
+        gint32 delta = (gint32) pyr[l][i] - (gint32) pyr[l + 1][i];
+
+        dog[l][i] = (gint16) CLAMP (delta, G_MININT16, G_MAXINT16);
+      }
 
   /* Detect keypoints */
   MafpKeypoint kps[MAFP_MAX_KP_TOTAL];
@@ -1001,10 +1009,14 @@ mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
           p[16] = kps[i].row;
           p[17] = kps[i].col;
           guint16 ori16 = (guint16) (kps[i].orientation / (2.0 * G_PI) * 65536.0);
-          memcpy (p + 18, &ori16, 2);
+          guint16 encoded_ori = GUINT16_TO_LE (ori16);
+
+          memcpy (p + 18, &encoded_ori, sizeof (encoded_ori));
           bcount++;
         }
-      memcpy (bdata, &bcount, sizeof (gint32));
+      guint32 encoded_count = GUINT32_TO_LE ((guint32) bcount);
+
+      memcpy (bdata, &encoded_count, sizeof (encoded_count));
     }
 
   /* Cleanup */
@@ -1013,9 +1025,13 @@ mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
   for (int l = 0; l < MAFP_DOG_LEVELS; l++)
     g_free (dog[l]);
 
-  gint32 b0, b1;
-  memcpy (&b0, tpl + 4, 4);
-  memcpy (&b1, tpl + 4 + MAFP_BANK_SZ, 4);
+  guint32 encoded_b0, encoded_b1;
+  guint b0, b1;
+
+  memcpy (&encoded_b0, tpl + 4, sizeof (encoded_b0));
+  memcpy (&encoded_b1, tpl + 4 + MAFP_BANK_SZ, sizeof (encoded_b1));
+  b0 = GUINT32_FROM_LE (encoded_b0);
+  b1 = GUINT32_FROM_LE (encoded_b1);
   fp_dbg ("extract: %d keypoints (%d + %d)", b0 + b1, b0, b1);
   return b0 + b1;
 }
@@ -1025,8 +1041,11 @@ mafp_extract_features (const guint16 *enhanced, guint8 *tpl)
 static inline int
 mafp_hamming (const guint8 *a, const guint8 *b)
 {
-  const guint64 *a64 = (const guint64 *) a;
-  const guint64 *b64 = (const guint64 *) b;
+  guint64 a64[2];
+  guint64 b64[2];
+
+  memcpy (a64, a, sizeof (a64));
+  memcpy (b64, b, sizeof (b64));
 
   return __builtin_popcountll (a64[0] ^ b64[0])
          + __builtin_popcountll (a64[1] ^ b64[1]);
@@ -1104,11 +1123,13 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
       const guint8 *gb = gallery + 4 + bank * MAFP_BANK_SZ;
       int bank_matches = 0;
 
-      gint32 np, ng;
-      memcpy (&np, pb, 4);
-      np = MIN (np, MAFP_MAX_KP);
-      memcpy (&ng, gb, 4);
-      ng = MIN (ng, MAFP_MAX_KP);
+      guint32 encoded_np, encoded_ng;
+      guint np, ng;
+
+      memcpy (&encoded_np, pb, sizeof (encoded_np));
+      np = MIN (GUINT32_FROM_LE (encoded_np), (guint32) MAFP_MAX_KP);
+      memcpy (&encoded_ng, gb, sizeof (encoded_ng));
+      ng = MIN (GUINT32_FROM_LE (encoded_ng), (guint32) MAFP_MAX_KP);
 
       const guint8 *pk = pb + 4, *gk = gb + 4;
 
@@ -1144,9 +1165,11 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
               corrs[n_corrs].pr = pd[16];
               corrs[n_corrs].pc = pd[17];
               memcpy (&corrs[n_corrs].p_ori, pd + 18, 2);
+              corrs[n_corrs].p_ori = GUINT16_FROM_LE (corrs[n_corrs].p_ori);
               corrs[n_corrs].gr = gk[best_gi * MAFP_KP_SIZE + 16];
               corrs[n_corrs].gc = gk[best_gi * MAFP_KP_SIZE + 17];
               memcpy (&corrs[n_corrs].g_ori, gk + best_gi * MAFP_KP_SIZE + 18, 2);
+              corrs[n_corrs].g_ori = GUINT16_FROM_LE (corrs[n_corrs].g_ori);
               n_corrs++;
               bank_matches++;
             }
@@ -1186,7 +1209,7 @@ mafp_match_templates (const guint8 *probe, const guint8 *gallery)
         /* Angular consistency: both correspondences must agree on rotation */
         guint16 dp = corrs[i].p_ori - corrs[j].p_ori;
         guint16 dg = corrs[i].g_ori - corrs[j].g_ori;
-        gint16 adiff = (gint16) (dp - dg);
+        gint32 adiff = (gint16) (dp - dg);
         if (adiff < 0)
           adiff = -adiff;
         if (adiff > 1822)  /* ~10 degrees */
@@ -1270,6 +1293,8 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
   g_autofree guint8 *tpl_buf = g_malloc0 (MAFP_TPL_BUF_SZ);
   int tpl_count = 0;
 
+  mafp8800_template_initialize (tpl_buf, MAFP_TPL_BUF_SZ);
+
   for (int stage = 0; stage < MAFP_ENROLL_STAGES; stage++)
     {
       if (mafp_is_canceled (self))
@@ -1339,7 +1364,9 @@ mafp_enroll_run (FpiDeviceMafp8800 *self)
   if (mafp_is_canceled (self))
     goto canceled;
 
-  memcpy (tpl_buf, &tpl_count, sizeof (gint32));
+  mafp8800_template_set_sample_count (tpl_buf,
+                                      MAFP_TPL_BUF_SZ,
+                                      tpl_count);
 
   FpPrint *print = NULL;
   fpi_device_get_enroll_data (FP_DEVICE (self), &print);
@@ -1413,11 +1440,15 @@ mafp_verify_run (FpiDeviceMafp8800 *self)
         {
           gsize tpl_sz = 0;
           const guint8 *tpl = g_variant_get_fixed_array (var, &tpl_sz, 1);
-          if (tpl_sz >= MAFP_TPL_HDR_SZ)
+          g_autoptr(GError) template_error = NULL;
+          guint count = 0;
+
+          if (mafp8800_template_validate (tpl,
+                                          tpl_sz,
+                                          &count,
+                                          &template_error))
             {
-              gint32 count = 0;
-              memcpy (&count, tpl, sizeof (gint32));
-              for (int i = 0; i < count && i < MAFP_ENROLL_STAGES; i++)
+              for (guint i = 0; i < count; i++)
                 {
                   const guint8 *sample = tpl + MAFP_TPL_HDR_SZ + i * MAFP_TPL_SAMPLE_SZ;
                   int score = mafp_match_templates (probe_tpl, sample);
@@ -1429,6 +1460,20 @@ mafp_verify_run (FpiDeviceMafp8800 *self)
                       break;
                     }
                 }
+            }
+          else
+            {
+              fp_warn ("Rejecting invalid MAFP8800 print: %s",
+                       template_error->message);
+              fpi_device_verify_report (
+                FP_DEVICE (self),
+                FPI_MATCH_ERROR,
+                NULL,
+                fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                          "%s",
+                                          template_error->message));
+              fpi_device_verify_complete (FP_DEVICE (self), NULL);
+              return;
             }
         }
 
@@ -1453,12 +1498,20 @@ mafp_verify_run (FpiDeviceMafp8800 *self)
 
           gsize tpl_sz = 0;
           const guint8 *tpl = g_variant_get_fixed_array (var, &tpl_sz, 1);
-          if (tpl_sz < MAFP_TPL_HDR_SZ)
-            continue;
+          g_autoptr(GError) template_error = NULL;
+          guint count = 0;
 
-          gint32 count = 0;
-          memcpy (&count, tpl, sizeof (gint32));
-          for (int i = 0; i < count && i < MAFP_ENROLL_STAGES; i++)
+          if (!mafp8800_template_validate (tpl,
+                                           tpl_sz,
+                                           &count,
+                                           &template_error))
+            {
+              fp_warn ("Skipping invalid MAFP8800 gallery print: %s",
+                       template_error->message);
+              continue;
+            }
+
+          for (guint i = 0; i < count; i++)
             {
               const guint8 *sample = tpl + MAFP_TPL_HDR_SZ + i * MAFP_TPL_SAMPLE_SZ;
               if (mafp_match_templates (probe_tpl, sample) >= MAFP_MATCH_THRESH)

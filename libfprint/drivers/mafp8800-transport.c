@@ -31,28 +31,28 @@ typedef struct
 {
   int           spi_fd;
   GCancellable *cancellable;
-  guint8        *frame;
-  gsize          frame_size;
+  guint8       *frame;
+  gsize         frame_size;
 
-  guint8 gain;
-  guint8 integration;
-  guint8 dac;
+  guint8        gain;
+  guint8        integration;
+  guint8        dac;
 
-  guint reset_attempts;
-  guint register_index;
-  guint8 chip_id;
+  guint         reset_attempts;
+  guint         register_index;
+  guint8        chip_id;
 } MafpCaptureContext;
 
 typedef struct
 {
   int           spi_fd;
   GCancellable *cancellable;
-  guint8        *gain;
-  guint8        *frame;
-  guint          iteration;
-  guint          low;
-  guint          high;
-  guint          midpoint;
+  guint8       *gain;
+  guint8       *frame;
+  guint         iteration;
+  guint         low;
+  guint         high;
+  guint         midpoint;
 } MafpGainContext;
 
 enum mafp_capture_state {
@@ -76,15 +76,19 @@ enum mafp_gain_state {
 };
 
 static void
-mafp_capture_context_free (MafpCaptureContext *context)
+mafp_capture_context_free (gpointer data)
 {
+  MafpCaptureContext *context = data;
+
   g_clear_object (&context->cancellable);
   g_free (context);
 }
 
 static void
-mafp_gain_context_free (MafpGainContext *context)
+mafp_gain_context_free (gpointer data)
 {
+  MafpGainContext *context = data;
+
   g_clear_object (&context->cancellable);
   g_clear_pointer (&context->frame, g_free);
   g_free (context);
@@ -130,6 +134,7 @@ mafp_capture_image_cb (FpiSpiTransfer *transfer,
                        GError         *error)
 {
   MafpCaptureContext *context = fpi_ssm_get_data (transfer->ssm);
+
   g_autoptr(GError) parse_error = NULL;
   guint parsed_rows = 0;
 
@@ -348,7 +353,9 @@ mafp_gain_handler (FpiSsm *ssm, FpDevice *device)
 
         context->iteration++;
         if (context->iteration < MAFP_GAIN_CALIBRATION_ITERATIONS)
-          fpi_ssm_jump_to_state (ssm, MAFP_GAIN_CAPTURE);
+          {
+            fpi_ssm_jump_to_state (ssm, MAFP_GAIN_CAPTURE);
+          }
         else
           {
             *context->gain = (guint8) context->midpoint;
@@ -418,7 +425,7 @@ mafp8800_fp36_capture_new (FpDevice     *device,
                      MAFP_CAPTURE_NUM_STATES);
   fpi_ssm_set_data (ssm,
                     context,
-                    (GDestroyNotify) mafp_capture_context_free);
+                    mafp_capture_context_free);
 
   return ssm;
 }
@@ -462,7 +469,7 @@ mafp8800_fp36_calibrate_gain_new (FpDevice     *device,
   ssm = fpi_ssm_new (device, mafp_gain_handler, MAFP_GAIN_NUM_STATES);
   fpi_ssm_set_data (ssm,
                     context,
-                    (GDestroyNotify) mafp_gain_context_free);
+                    mafp_gain_context_free);
 
   return ssm;
 }

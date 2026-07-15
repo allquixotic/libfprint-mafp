@@ -125,6 +125,7 @@ driver_sources = {
     'mafp8800' : files(
         'drivers/mafp8800.c',
         'drivers/mafp8800-proto.c',
+        'drivers/mafp8800-template.c',
         'drivers/mafp8800-transport.c',
     ),
     'nb1010' : files('drivers/nb1010.c'),
