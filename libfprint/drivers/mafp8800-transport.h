@@ -23,4 +23,9 @@ FpiSsm *mafp8800_fp36_capture_new (FpDevice      *device,
                                    guint8        *frame,
                                    gsize          frame_size);
 
+FpiSsm *mafp8800_fp36_calibrate_gain_new (FpDevice     *device,
+                                          int           spi_fd,
+                                          GCancellable *cancellable,
+                                          guint8       *gain);
+
 G_END_DECLS

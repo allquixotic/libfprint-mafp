@@ -226,6 +226,109 @@ test_parse_randomized_layouts (void)
     }
 }
 
+static void
+set_frame_pixel (guint8 *frame, guint row, guint column, guint16 value)
+{
+  gsize offset = (gsize) row * MAFP8800_FP36_ROW_SIZE + column * 2;
+
+  frame[offset] = value & 0xFF;
+  frame[offset + 1] = value >> 8;
+}
+
+static void
+test_enhance_normalizes_signed_delta (void)
+{
+  g_autofree guint8 *background = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  g_autofree guint8 *finger = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  g_autofree guint16 *enhanced =
+    g_new0 (guint16, MAFP8800_FP36_ENHANCED_PIXELS);
+  g_autoptr(GError) error = NULL;
+
+  for (guint row = 0; row < MAFP8800_FP36_ROWS; row++)
+    for (guint column = 0; column < MAFP8800_FP36_COLUMNS; column++)
+      {
+        guint16 delta = (guint16) (row * MAFP8800_FP36_COLUMNS + column);
+
+        set_frame_pixel (background, row, column, 10000);
+        set_frame_pixel (finger, row, column, 10000 - delta);
+      }
+
+  g_assert_true (mafp8800_enhance_fp36_frame (
+                   background,
+                   MAFP8800_FP36_FRAME_SIZE,
+                   finger,
+                   MAFP8800_FP36_FRAME_SIZE,
+                   enhanced,
+                   MAFP8800_FP36_ENHANCED_PIXELS,
+                   &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (enhanced[0], ==, 0);
+  g_assert_cmpuint (enhanced[MAFP8800_FP36_ENHANCED_PIXELS - 1], ==,
+                    G_MAXUINT16);
+  for (gsize i = 1; i < MAFP8800_FP36_ENHANCED_PIXELS; i++)
+    g_assert_cmpuint (enhanced[i], >=, enhanced[i - 1]);
+}
+
+static void
+test_enhance_low_contrast_is_zero (void)
+{
+  g_autofree guint8 *background = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  g_autofree guint8 *finger = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  g_autofree guint16 *enhanced =
+    g_new (guint16, MAFP8800_FP36_ENHANCED_PIXELS);
+  g_autoptr(GError) error = NULL;
+
+  memset (enhanced,
+          0xA5,
+          MAFP8800_FP36_ENHANCED_PIXELS * sizeof (guint16));
+  g_assert_true (mafp8800_enhance_fp36_frame (
+                   background,
+                   MAFP8800_FP36_FRAME_SIZE,
+                   finger,
+                   MAFP8800_FP36_FRAME_SIZE,
+                   enhanced,
+                   MAFP8800_FP36_ENHANCED_PIXELS,
+                   &error));
+  g_assert_no_error (error);
+  for (gsize i = 0; i < MAFP8800_FP36_ENHANCED_PIXELS; i++)
+    g_assert_cmpuint (enhanced[i], ==, 0);
+}
+
+static void
+test_enhance_rejects_short_buffers (void)
+{
+  g_autofree guint8 *frame = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  g_autofree guint16 *enhanced =
+    g_new (guint16, MAFP8800_FP36_ENHANCED_PIXELS);
+  g_autoptr(GError) error = NULL;
+
+  memset (enhanced,
+          0xA5,
+          MAFP8800_FP36_ENHANCED_PIXELS * sizeof (guint16));
+  g_assert_false (mafp8800_enhance_fp36_frame (
+                    frame,
+                    MAFP8800_FP36_FRAME_SIZE - 1,
+                    frame,
+                    MAFP8800_FP36_FRAME_SIZE,
+                    enhanced,
+                    MAFP8800_FP36_ENHANCED_PIXELS,
+                    &error));
+  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
+  for (gsize i = 0; i < MAFP8800_FP36_ENHANCED_PIXELS; i++)
+    g_assert_cmphex (enhanced[i], ==, 0xA5A5);
+
+  g_clear_error (&error);
+  g_assert_false (mafp8800_enhance_fp36_frame (
+                    frame,
+                    MAFP8800_FP36_FRAME_SIZE,
+                    frame,
+                    MAFP8800_FP36_FRAME_SIZE,
+                    enhanced,
+                    MAFP8800_FP36_ENHANCED_PIXELS - 1,
+                    &error));
+  g_assert_error (error, G_IO_ERROR, G_IO_ERROR_NO_SPACE);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -241,6 +344,12 @@ main (int argc, char *argv[])
                    test_parse_all_truncation_boundaries);
   g_test_add_func ("/mafp8800/proto/randomized-layouts",
                    test_parse_randomized_layouts);
+  g_test_add_func ("/mafp8800/proto/enhance/normalizes-signed-delta",
+                   test_enhance_normalizes_signed_delta);
+  g_test_add_func ("/mafp8800/proto/enhance/low-contrast-is-zero",
+                   test_enhance_low_contrast_is_zero);
+  g_test_add_func ("/mafp8800/proto/enhance/rejects-short-buffers",
+                   test_enhance_rejects_short_buffers);
 
   return g_test_run ();
 }

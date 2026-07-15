@@ -36,6 +36,8 @@ typedef struct
   guint ioctl_calls;
 
   gboolean fail_image;
+  gboolean calibration;
+  guint8   current_gain;
 } SpiFixture;
 
 typedef struct
@@ -70,6 +72,9 @@ append_wire_row (guint8 *raw, gsize offset, guint row)
     {
       guint16 value = (guint16) (row * MAFP8800_FP36_COLUMNS + column);
 
+      if (fixture.calibration)
+        value = (guint16) fixture.current_gain * 32;
+
       raw[offset++] = value >> 8;
       raw[offset++] = value & 0xFF;
     }
@@ -94,6 +99,27 @@ fixture_reset (guint raw_rows, guint id_ready_after, gboolean fail_image)
       offset += row % 3;
     }
 
+  g_assert_cmpuint (offset, <, sizeof (fixture.raw));
+}
+
+static void
+fixture_reset_calibration (guint raw_rows)
+{
+  fixture_reset (raw_rows, 1, FALSE);
+  fixture.calibration = TRUE;
+}
+
+static void
+fixture_build_calibration_raw (void)
+{
+  gsize offset = 11;
+
+  memset (fixture.raw, 0xEE, sizeof (fixture.raw));
+  for (guint row = 0; row < fixture.raw_rows; row++)
+    {
+      offset = append_wire_row (fixture.raw, offset, row);
+      offset += row % 3;
+    }
   g_assert_cmpuint (offset, <, sizeof (fixture.raw));
 }
 
@@ -129,6 +155,7 @@ __wrap_ioctl (int fd, unsigned long request, ...)
         case 0x8C:
           g_assert_cmphex (write_buffer[1], ==, 0xFF);
           fixture.reset_writes++;
+          fixture.raw_offset = 0;
           break;
 
         case 0x04:
@@ -139,15 +166,30 @@ __wrap_ioctl (int fd, unsigned long request, ...)
           break;
 
         default:
-          g_assert_cmpuint (fixture.register_index,
-                            <,
-                            G_N_ELEMENTS (expected_registers));
-          g_assert_cmphex (write_buffer[0], ==,
-                           expected_registers[fixture.register_index][0]);
-          g_assert_cmphex (write_buffer[1], ==,
-                           expected_registers[fixture.register_index][1]);
-          fixture.register_index++;
-          break;
+          {
+            guint register_in_sequence =
+              fixture.register_index % G_N_ELEMENTS (expected_registers);
+
+            g_assert_cmphex (write_buffer[0], ==,
+                             expected_registers[register_in_sequence][0]);
+            if (register_in_sequence == 1)
+              {
+                fixture.current_gain = write_buffer[1];
+                if (!fixture.calibration)
+                  g_assert_cmphex (write_buffer[1], ==, 0x37);
+              }
+            else if (register_in_sequence == 5)
+              g_assert_cmphex (write_buffer[1], ==,
+                               fixture.calibration ? 0x4C : 0x19);
+            else if (register_in_sequence == 6)
+              g_assert_cmphex (write_buffer[1], ==,
+                               fixture.calibration ? 0x54 : 0xA1);
+            else
+              g_assert_cmphex (write_buffer[1], ==,
+                               expected_registers[register_in_sequence][1]);
+            fixture.register_index++;
+            break;
+          }
         }
     }
   else if (transfer->len == 0x26)
@@ -161,7 +203,11 @@ __wrap_ioctl (int fd, unsigned long request, ...)
                         <=,
                         sizeof (fixture.raw));
       if (fixture.raw_offset == 0)
-        g_assert_cmphex (write_buffer[0], ==, 0x70);
+        {
+          g_assert_cmphex (write_buffer[0], ==, 0x70);
+          if (fixture.calibration)
+            fixture_build_calibration_raw ();
+        }
       else
         g_assert_cmphex (write_buffer[0], ==, 0xFF);
 
@@ -222,6 +268,28 @@ run_capture (guint          raw_rows,
                                    0xA1,
                                    frame,
                                    MAFP8800_FP36_FRAME_SIZE);
+  g_assert_nonnull (ssm);
+  fpi_ssm_start (ssm, capture_complete_cb);
+  if (!result->complete)
+    g_main_loop_run (result->loop);
+}
+
+static void
+run_gain_calibration (guint          raw_rows,
+                      guint8        *gain,
+                      CaptureResult *result)
+{
+  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
+  g_autoptr(GCancellable) cancellable = g_cancellable_new ();
+  FpiSsm *ssm;
+
+  fixture_reset_calibration (raw_rows);
+  g_object_set_data (G_OBJECT (device), "mafp-capture-result", result);
+
+  ssm = mafp8800_fp36_calibrate_gain_new (device,
+                                          TEST_FD,
+                                          cancellable,
+                                          gain);
   g_assert_nonnull (ssm);
   fpi_ssm_start (ssm, capture_complete_cb);
   if (!result->complete)
@@ -339,6 +407,48 @@ test_capture_pre_cancelled (void)
   assert_frame_clear (frame);
 }
 
+static void
+test_gain_calibration_success (void)
+{
+  g_autoptr(GMainLoop) loop = g_main_loop_new (NULL, FALSE);
+  CaptureResult result = {
+    .loop = loop,
+    .main_thread = g_thread_self (),
+  };
+  guint8 gain = 0;
+
+  run_gain_calibration (MAFP8800_FP36_ROWS, &gain, &result);
+
+  g_assert_no_error (result.error);
+  g_assert_cmpuint (gain, ==, 28);
+  g_assert_cmpuint (fixture.reset_writes, ==, 8);
+  g_assert_cmpuint (fixture.id_polls, ==, 8);
+  g_assert_cmpuint (fixture.register_index, ==,
+                    8 * G_N_ELEMENTS (expected_registers));
+  g_assert_cmpuint (fixture.flushes, ==, 8);
+  g_assert_cmpuint (fixture.image_calls, >=, 8);
+}
+
+static void
+test_gain_calibration_rejects_incomplete_frame (void)
+{
+  g_autoptr(GMainLoop) loop = g_main_loop_new (NULL, FALSE);
+  CaptureResult result = {
+    .loop = loop,
+    .main_thread = g_thread_self (),
+  };
+  guint8 gain = 0xFF;
+
+  run_gain_calibration (MAFP8800_FP36_ROWS - 1, &gain, &result);
+
+  g_assert_error (result.error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA);
+  g_clear_error (&result.error);
+  g_assert_cmpuint (gain, ==, 0);
+  g_assert_cmpuint (fixture.reset_writes, ==, 1);
+  g_assert_cmpuint (fixture.register_index, ==,
+                    G_N_ELEMENTS (expected_registers));
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -354,6 +464,10 @@ main (int argc, char *argv[])
                    test_capture_reset_timeout);
   g_test_add_func ("/mafp8800/transport/capture/pre-cancelled",
                    test_capture_pre_cancelled);
+  g_test_add_func ("/mafp8800/transport/gain/success",
+                   test_gain_calibration_success);
+  g_test_add_func ("/mafp8800/transport/gain/incomplete-frame",
+                   test_gain_calibration_rejects_incomplete_frame);
 
   return g_test_run ();
 }

@@ -17,6 +17,9 @@
 #define MAFP_RESET_ATTEMPTS 20
 #define MAFP_REGISTER_TRANSFER_SIZE 4
 #define MAFP_FLUSH_TRANSFER_SIZE 0x26
+#define MAFP_GAIN_CALIBRATION_ITERATIONS 8
+#define MAFP_GAIN_CALIBRATION_BYTES 0x250
+#define MAFP_GAIN_CALIBRATION_TARGET 0x4007F
 
 typedef struct
 {
@@ -40,6 +43,18 @@ typedef struct
   guint8 chip_id;
 } MafpCaptureContext;
 
+typedef struct
+{
+  int           spi_fd;
+  GCancellable *cancellable;
+  guint8        *gain;
+  guint8        *frame;
+  guint          iteration;
+  guint          low;
+  guint          high;
+  guint          midpoint;
+} MafpGainContext;
+
 enum mafp_capture_state {
   MAFP_CAPTURE_RESET,
   MAFP_CAPTURE_RESET_WAIT,
@@ -53,10 +68,25 @@ enum mafp_capture_state {
   MAFP_CAPTURE_NUM_STATES,
 };
 
+enum mafp_gain_state {
+  MAFP_GAIN_CAPTURE,
+  MAFP_GAIN_ANALYZE,
+  MAFP_GAIN_COMPLETE,
+  MAFP_GAIN_NUM_STATES,
+};
+
 static void
 mafp_capture_context_free (MafpCaptureContext *context)
 {
   g_clear_object (&context->cancellable);
+  g_free (context);
+}
+
+static void
+mafp_gain_context_free (MafpGainContext *context)
+{
+  g_clear_object (&context->cancellable);
+  g_clear_pointer (&context->frame, g_free);
   g_free (context);
 }
 
@@ -259,6 +289,83 @@ mafp_capture_handler (FpiSsm *ssm, FpDevice *device)
     }
 }
 
+static void
+mafp_gain_handler (FpiSsm *ssm, FpDevice *device)
+{
+  MafpGainContext *context = fpi_ssm_get_data (ssm);
+
+  if (context->cancellable && g_cancellable_is_cancelled (context->cancellable))
+    {
+      fpi_ssm_mark_failed (ssm,
+                           g_error_new_literal (G_IO_ERROR,
+                                                G_IO_ERROR_CANCELLED,
+                                                "FP36 gain calibration cancelled"));
+      return;
+    }
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case MAFP_GAIN_CAPTURE:
+      {
+        FpiSsm *capture;
+
+        context->midpoint = (context->low + context->high) / 2;
+        capture = mafp8800_fp36_capture_new (device,
+                                             context->spi_fd,
+                                             context->cancellable,
+                                             (guint8) context->midpoint,
+                                             0x4C,
+                                             0x54,
+                                             context->frame,
+                                             MAFP8800_FP36_FRAME_SIZE);
+        fpi_ssm_start_subsm (ssm, capture);
+        return;
+      }
+
+    case MAFP_GAIN_ANALYZE:
+      {
+        guint64 total = 0;
+
+        for (gsize offset = 0;
+             offset < MAFP_GAIN_CALIBRATION_BYTES;
+             offset += sizeof (guint16))
+          {
+            guint16 value = (guint16) context->frame[offset] |
+                            ((guint16) context->frame[offset + 1] << 8);
+            total += value;
+          }
+
+        fp_dbg ("FP36 gain calibration %u/%u: gain=%u total=%" G_GUINT64_FORMAT,
+                context->iteration + 1,
+                MAFP_GAIN_CALIBRATION_ITERATIONS,
+                context->midpoint,
+                total);
+
+        if (total > MAFP_GAIN_CALIBRATION_TARGET)
+          context->high = context->midpoint;
+        else
+          context->low = context->midpoint;
+
+        context->iteration++;
+        if (context->iteration < MAFP_GAIN_CALIBRATION_ITERATIONS)
+          fpi_ssm_jump_to_state (ssm, MAFP_GAIN_CAPTURE);
+        else
+          {
+            *context->gain = (guint8) context->midpoint;
+            fpi_ssm_next_state (ssm);
+          }
+        return;
+      }
+
+    case MAFP_GAIN_COMPLETE:
+      fpi_ssm_mark_completed (ssm);
+      return;
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
 /**
  * mafp8800_fp36_capture_new:
  * @device: device associated with the transfer
@@ -312,6 +419,50 @@ mafp8800_fp36_capture_new (FpDevice     *device,
   fpi_ssm_set_data (ssm,
                     context,
                     (GDestroyNotify) mafp_capture_context_free);
+
+  return ssm;
+}
+
+/**
+ * mafp8800_fp36_calibrate_gain_new:
+ * @device: device associated with the transfers
+ * @spi_fd: open spidev file descriptor
+ * @cancellable: (nullable): cancellation object for the operation
+ * @gain: caller-owned destination for the calibrated gain
+ *
+ * Builds an asynchronous eight-step bounded binary search for the FP36
+ * capture gain. Each sample is a complete, parser-validated frame captured by
+ * mafp8800_fp36_capture_new(), so a short or malformed response fails the
+ * calibration instead of influencing the selected gain.
+ *
+ * Returns: (transfer full): a new, not-yet-started state machine
+ */
+FpiSsm *
+mafp8800_fp36_calibrate_gain_new (FpDevice     *device,
+                                  int           spi_fd,
+                                  GCancellable *cancellable,
+                                  guint8       *gain)
+{
+  MafpGainContext *context;
+  FpiSsm *ssm;
+
+  g_return_val_if_fail (FP_IS_DEVICE (device), NULL);
+  g_return_val_if_fail (spi_fd >= 0, NULL);
+  g_return_val_if_fail (gain != NULL, NULL);
+
+  *gain = 0;
+  context = g_new0 (MafpGainContext, 1);
+  context->spi_fd = spi_fd;
+  context->cancellable = cancellable ? g_object_ref (cancellable) : NULL;
+  context->gain = gain;
+  context->frame = g_malloc0 (MAFP8800_FP36_FRAME_SIZE);
+  context->low = 0;
+  context->high = G_MAXUINT8;
+
+  ssm = fpi_ssm_new (device, mafp_gain_handler, MAFP_GAIN_NUM_STATES);
+  fpi_ssm_set_data (ssm,
+                    context,
+                    (GDestroyNotify) mafp_gain_context_free);
 
   return ssm;
 }

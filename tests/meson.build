@@ -287,6 +287,20 @@ test_utils = static_library('fprint-test-utils',
     dependencies: libfprint_private_dep,
     install: false)
 
+if have_spi
+    executable('mafp8800-capture-tool',
+        sources: files(
+            'mafp8800-capture-tool.c',
+            '../libfprint/drivers/mafp8800-proto.c',
+            '../libfprint/drivers/mafp8800-transport.c',
+        ),
+        dependencies: [libfprint_private_dep],
+        c_args: common_cflags,
+        link_whole: test_utils,
+        install: false,
+    )
+endif
+
 unit_tests = [
     'fpi-device',
     'fpi-ssm',

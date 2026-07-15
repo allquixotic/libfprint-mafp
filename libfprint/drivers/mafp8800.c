@@ -47,8 +47,8 @@
 #define MAFP_ROW_BYTES MAFP8800_FP36_ROW_SIZE
 #define MAFP_PIXELS (MAFP_ROWS * MAFP_COLS)            /* 5920 */
 #define MAFP_FRAME_BYTES MAFP8800_FP36_FRAME_SIZE
-#define MAFP_ENHANCED_COLS 36          /* column 0 stripped */
-#define MAFP_ENHANCED_PIXELS (MAFP_ROWS * MAFP_ENHANCED_COLS)   /* 5760 */
+#define MAFP_ENHANCED_COLS MAFP8800_FP36_ENHANCED_COLUMNS
+#define MAFP_ENHANCED_PIXELS MAFP8800_FP36_ENHANCED_PIXELS
 
 /* SPI */
 #define MAFP_SPI_SPEED 4000000
@@ -560,41 +560,16 @@ mafp_fp36_finger_is_stable (FpiDeviceMafp8800 *self)
 static void
 mafp_fp36_enhance (FpiDeviceMafp8800 *self)
 {
-  guint16 *out = self->enhanced;
-  const guint8 *bg = self->bg_frame;       /* no-finger background */
-  const guint8 *finger = self->cur_frame;  /* current capture with finger */
+  g_autoptr(GError) error = NULL;
 
-  guint16 px_min = 0xFFFF, px_max = 0;
-
-  /* Background subtract with +10000 offset, skip column 0 */
-  for (int row = 0; row < MAFP_ROWS; row++)
-    for (int col = 1; col < MAFP_COLS; col++)
-      {
-        guint16 bg_val = frame_pixel (bg, row, col);
-        guint16 fg_val = frame_pixel (finger, row, col);
-        guint16 val = (guint16) ((bg_val + 10000 - fg_val) & 0xFFFF);
-        int idx = row * MAFP_ENHANCED_COLS + (col - 1);
-        out[idx] = val;
-        if (val < px_min)
-          px_min = val;
-        if (val > px_max)
-          px_max = val;
-      }
-
-  guint16 range = px_max - px_min;
-  if (range <= 50)
-    {
-      memset (out, 0, MAFP_ENHANCED_PIXELS * sizeof (guint16));
-      return;
-    }
-
-  /* Normalize to full 16-bit range */
-  for (int i = 0; i < MAFP_ENHANCED_PIXELS; i++)
-    {
-      guint32 val = out[i] - px_min;
-      val = (val * 0xFFFF) / range;
-      out[i] = (guint16) MIN (val, 0xFFFF);
-    }
+  if (!mafp8800_enhance_fp36_frame (self->bg_frame,
+                                    MAFP_FRAME_BYTES,
+                                    self->cur_frame,
+                                    MAFP_FRAME_BYTES,
+                                    self->enhanced,
+                                    MAFP_ENHANCED_PIXELS,
+                                    &error))
+    fp_warn ("Failed to enhance FP36 frame: %s", error->message);
 }
 
 /* Scale-space keypoint matching */
