@@ -142,7 +142,7 @@ static void
 fpi_spi_transfer_free (FpiSpiTransfer *self)
 {
   g_assert (self);
-  g_assert_cmpint (self->ref_count, ==, 0);
+  g_assert_cmpint (g_atomic_int_get (&self->ref_count), ==, 0);
 
   if (self->free_buffer_wr && self->buffer_wr)
     self->free_buffer_wr (self->buffer_wr);
@@ -166,7 +166,7 @@ FpiSpiTransfer *
 fpi_spi_transfer_ref (FpiSpiTransfer *self)
 {
   g_return_val_if_fail (self, NULL);
-  g_return_val_if_fail (self->ref_count, NULL);
+  g_return_val_if_fail (g_atomic_int_get (&self->ref_count) > 0, NULL);
 
   g_atomic_int_inc (&self->ref_count);
 
@@ -184,7 +184,7 @@ void
 fpi_spi_transfer_unref (FpiSpiTransfer *self)
 {
   g_return_if_fail (self);
-  g_return_if_fail (self->ref_count);
+  g_return_if_fail (g_atomic_int_get (&self->ref_count) > 0);
 
   if (g_atomic_int_dec_and_test (&self->ref_count))
     fpi_spi_transfer_free (self);
@@ -342,13 +342,19 @@ static void
 transfer_finish_cb (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
   GTask *task = G_TASK (res);
-  FpiSpiTransfer *transfer = g_task_get_task_data (task);
+
+  g_autoptr(FpiSpiTransfer) transfer =
+    fpi_spi_transfer_ref (g_task_get_task_data (task));
   GError *error = NULL;
   FpiSpiTransferCallback callback;
 
-  /* Acquire all writes made by transfer_thread_func() before inspecting the
-   * result buffers or invoking driver code. */
-  g_assert_cmpint (g_atomic_int_get (&transfer->worker_complete), ==, 1);
+  g_return_if_fail (transfer != NULL);
+
+  /* GTask may dispatch the main-context callback just before its worker-side
+   * return helper finishes.  Wait for the final release so that it covers the
+   * result buffers, error object, and GTask's completion-source handoff. */
+  while (g_atomic_int_get (&transfer->worker_complete) == 0)
+    g_thread_yield ();
 
   g_task_propagate_boolean (task, &error);
 
@@ -466,11 +472,12 @@ transfer_thread_func (GTask        *task,
 
   if (transfer->buffer_wr == NULL && transfer->buffer_rd == NULL)
     {
+      GError *error = g_error_new_literal (G_IO_ERROR,
+                                           G_IO_ERROR_INVALID_ARGUMENT,
+                                           "Transfer with neither write or read!");
+
+      g_task_return_error (task, error);
       g_atomic_int_set (&transfer->worker_complete, 1);
-      g_task_return_new_error (task,
-                               G_IO_ERROR,
-                               G_IO_ERROR_INVALID_ARGUMENT,
-                               "Transfer with neither write or read!");
       return;
     }
 
@@ -496,32 +503,35 @@ transfer_thread_func (GTask        *task,
        * prevent additional chunks from being submitted. */
       if (cancellable && g_cancellable_is_cancelled (cancellable))
         {
+          GError *error = g_error_new_literal (G_IO_ERROR,
+                                               G_IO_ERROR_CANCELLED,
+                                               "SPI transfer was cancelled");
+
+          g_task_return_error (task, error);
           g_atomic_int_set (&transfer->worker_complete, 1);
-          g_task_return_new_error (task,
-                                   G_IO_ERROR,
-                                   G_IO_ERROR_CANCELLED,
-                                   "SPI transfer was cancelled");
           return;
         }
 
       status = transfer_chunk (transfer, full_length, &transferred);
     }
 
-  /* Publish ioctl output and all other worker writes before GTask schedules
-   * the completion callback on the originating main context. */
-  g_atomic_int_set (&transfer->worker_complete, 1);
-
   if (status < 0)
     {
-      g_task_return_new_error (task,
-                               G_IO_ERROR,
-                               g_io_error_from_errno (errno),
-                               "Error invoking ioctl for SPI transfer (%d)",
-                               errno);
+      int saved_errno = errno;
+      GError *error = g_error_new (G_IO_ERROR,
+                                   g_io_error_from_errno (saved_errno),
+                                   "Error invoking ioctl for SPI transfer (%d)",
+                                   saved_errno);
+
+      g_task_return_error (task, error);
+      /* Publish the error, ioctl output, and completion-source handoff. */
+      g_atomic_int_set (&transfer->worker_complete, 1);
     }
   else
     {
       g_task_return_boolean (task, TRUE);
+      /* Publish ioctl output and the completion-source handoff. */
+      g_atomic_int_set (&transfer->worker_complete, 1);
     }
 }
 
