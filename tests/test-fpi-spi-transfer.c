@@ -97,6 +97,7 @@ transfer_done_cb (FpiSpiTransfer *transfer,
                          transfer->buffer_wr[i] ^ TEST_MASK);
     }
 
+  g_clear_error (&error);
   g_main_loop_quit (data->loop);
 }
 
