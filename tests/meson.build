@@ -291,6 +291,8 @@ if have_spi
     executable('mafp8800-capture-tool',
         sources: files(
             'mafp8800-capture-tool.c',
+            '../libfprint/drivers/mafp8800-acquisition.c',
+            '../libfprint/drivers/mafp8800-press.c',
             '../libfprint/drivers/mafp8800-proto.c',
             '../libfprint/drivers/mafp8800-transport.c',
         ),
@@ -299,6 +301,17 @@ if have_spi
         link_whole: test_utils,
         install: false,
     )
+
+    mafp8800_action_tool = executable('mafp8800-action-tool',
+        sources: files('mafp8800-action-tool.c'),
+        dependencies: [libfprint_dep, glib_dep],
+        c_args: common_cflags,
+        install: false,
+    )
+    test('mafp8800-action-tool-help',
+        mafp8800_action_tool,
+        args: ['--help'],
+    )
 endif
 
 unit_tests = [
@@ -306,6 +319,8 @@ unit_tests = [
     'fpi-ssm',
     'fpi-assembling',
     'fpi-spi-transfer',
+    'fpi-mafp8800-driver',
+    'fpi-mafp8800-press',
     'fpi-mafp8800-proto',
     'fpi-mafp8800-template',
     'fpi-mafp8800-transport',
@@ -321,9 +336,23 @@ endif
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
 unit_tests_link_args = {
     'fpi-spi-transfer' : ['-Wl,--wrap=ioctl'],
+    'fpi-mafp8800-driver' : ['-Wl,--wrap=ioctl'],
     'fpi-mafp8800-transport' : ['-Wl,--wrap=ioctl'],
 }
 unit_tests_sources = {
+    'fpi-mafp8800-driver': files(
+        'test-fpi-mafp8800-driver.c',
+        '../libfprint/drivers/mafp8800.c',
+        '../libfprint/drivers/mafp8800-acquisition.c',
+        '../libfprint/drivers/mafp8800-press.c',
+        '../libfprint/drivers/mafp8800-proto.c',
+        '../libfprint/drivers/mafp8800-template.c',
+        '../libfprint/drivers/mafp8800-transport.c',
+    ),
+    'fpi-mafp8800-press': files(
+        'test-fpi-mafp8800-press.c',
+        '../libfprint/drivers/mafp8800-press.c',
+    ),
     'fpi-mafp8800-proto': files(
         'test-fpi-mafp8800-proto.c',
         '../libfprint/drivers/mafp8800-proto.c',
@@ -334,6 +363,8 @@ unit_tests_sources = {
     ),
     'fpi-mafp8800-transport': files(
         'test-fpi-mafp8800-transport.c',
+        '../libfprint/drivers/mafp8800-acquisition.c',
+        '../libfprint/drivers/mafp8800-press.c',
         '../libfprint/drivers/mafp8800-proto.c',
         '../libfprint/drivers/mafp8800-transport.c',
     ),

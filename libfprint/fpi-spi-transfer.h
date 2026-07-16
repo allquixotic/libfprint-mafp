@@ -65,12 +65,16 @@ struct _FpiSpiTransfer
 
   /* Explicit publication barriers around the GTask worker handoff.  These
    * also document that no transfer fields may be mutated while submitted. */
-  gint     submitted;
-  gint     worker_complete;
+  gint submitted;
+  gint worker_complete;
 
-  int      spidev_fd;
+  /* Strong reference held only between asynchronous submit and its
+   * main-context callback. */
+  FpDevice *submitted_device;
 
-  gboolean full_duplex;
+  int       spidev_fd;
+
+  gboolean  full_duplex;
 
   /* Callbacks */
   gpointer               user_data;

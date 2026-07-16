@@ -76,6 +76,22 @@ enum mafp_gain_state {
 };
 
 static void
+mafp_clear_buffer (gpointer data, gsize size)
+{
+  volatile guint8 *bytes = data;
+
+  while (size-- > 0)
+    *bytes++ = 0;
+}
+
+static void
+mafp_raw_buffer_free (gpointer data)
+{
+  mafp_clear_buffer (data, MAFP8800_FP36_RAW_SIZE);
+  g_free (data);
+}
+
+static void
 mafp_capture_context_free (gpointer data)
 {
   MafpCaptureContext *context = data;
@@ -90,6 +106,7 @@ mafp_gain_context_free (gpointer data)
   MafpGainContext *context = data;
 
   g_clear_object (&context->cancellable);
+  mafp_clear_buffer (context->frame, MAFP8800_FP36_FRAME_SIZE);
   g_clear_pointer (&context->frame, g_free);
   g_free (context);
 }
@@ -275,7 +292,13 @@ mafp_capture_handler (FpiSsm *ssm, FpDevice *device)
 
     case MAFP_CAPTURE_READ_IMAGE:
       transfer = fpi_spi_transfer_new (device, context->spi_fd);
-      fpi_spi_transfer_duplex (transfer, MAFP8800_FP36_RAW_SIZE);
+      fpi_spi_transfer_duplex_full (
+        transfer,
+        g_malloc0 (MAFP8800_FP36_RAW_SIZE),
+        g_malloc0 (MAFP8800_FP36_RAW_SIZE),
+        MAFP8800_FP36_RAW_SIZE,
+        mafp_raw_buffer_free,
+        mafp_raw_buffer_free);
       memset (transfer->buffer_wr, 0xFF, transfer->length_wr);
       transfer->buffer_wr[0] = 0x70;
       transfer->ssm = ssm;

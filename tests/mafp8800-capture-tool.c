@@ -13,6 +13,8 @@
 
 #include <glib-unix.h>
 
+#include "drivers/mafp8800-acquisition.h"
+#include "drivers/mafp8800-press.h"
 #include "drivers/mafp8800-proto.h"
 #include "drivers/mafp8800-transport.h"
 #include "test-device-fake.h"
@@ -20,6 +22,12 @@
 #define CAPTURE_TIMEOUT_SECONDS 15
 #define CAPTURE_INTEGRATION 0x02
 #define CAPTURE_DAC 0xA1
+
+typedef enum {
+  CAPTURE_MODE_BACKGROUND,
+  CAPTURE_MODE_MANUAL_FINGER,
+  CAPTURE_MODE_STABLE_PRESS,
+} CaptureMode;
 
 typedef struct
 {
@@ -34,6 +42,15 @@ typedef struct
   GMainLoop    *loop;
   gboolean      prompting;
 } CaptureControl;
+
+static void
+clear_sensitive (gpointer data, gsize size)
+{
+  volatile guint8 *bytes = data;
+
+  while (size-- > 0)
+    *bytes++ = 0;
+}
 
 static gboolean
 cancel_capture (gpointer user_data)
@@ -94,6 +111,7 @@ write_pixels_pgm (const char    *path,
   guint16 minimum = G_MAXUINT16;
   guint16 maximum = 0;
   guint64 sum = 0;
+  gboolean written;
 
   header_size = g_snprintf (header,
                             sizeof (header),
@@ -120,10 +138,13 @@ write_pixels_pgm (const char    *path,
       sum += value;
     }
 
-  if (!g_file_set_contents (path,
-                            (const char *) contents,
-                            (gssize) ((gsize) header_size + pixel_bytes),
-                            error))
+  written = g_file_set_contents (
+    path,
+    (const char *) contents,
+    (gssize) ((gsize) header_size + pixel_bytes),
+    error);
+  clear_sensitive (contents, (gsize) header_size + pixel_bytes);
+  if (!written)
     return FALSE;
 
   g_print ("Captured complete %ux%u frame: min=%u max=%u mean=%.1f\n",
@@ -178,13 +199,22 @@ main (int argc, char *argv[])
   guint signal_source;
   guint timeout_source;
   guint8 gain = 0;
-  gboolean finger_mode;
+  CaptureMode mode = CAPTURE_MODE_BACKGROUND;
+  gboolean stable = FALSE;
+  guint changed_pixels = 0;
+  guint64 stability_sad = 0;
+  int exit_status = 0;
   int spi_fd;
 
-  finger_mode = argc == 4 && g_str_equal (argv[3], "--finger");
-  if (argc != 3 && !finger_mode)
+  if (argc == 4 && g_str_equal (argv[3], "--finger"))
+    mode = CAPTURE_MODE_MANUAL_FINGER;
+  else if (argc == 4 && g_str_equal (argv[3], "--press"))
+    mode = CAPTURE_MODE_STABLE_PRESS;
+
+  if (argc != 3 && mode == CAPTURE_MODE_BACKGROUND)
     {
-      g_printerr ("Usage: %s /dev/spidevB.C output.pgm [--finger]\n",
+      g_printerr ("Usage: %s /dev/spidevB.C output.pgm "
+                  "[--finger|--press]\n",
                   argv[0]);
       return 2;
     }
@@ -248,29 +278,37 @@ main (int argc, char *argv[])
       g_clear_handle_id (&timeout_source, g_source_remove);
     }
 
-  if (!result.error && finger_mode)
+  if (!result.error && mode != CAPTURE_MODE_BACKGROUND)
     {
       memcpy (background, frame, MAFP8800_FP36_FRAME_SIZE);
-      g_print ("Background captured. Place one finger flat on the reader, "
-               "then press Enter (Ctrl+C cancels): ");
-      fflush (stdout);
-      result.complete = FALSE;
-      control.prompting = TRUE;
-      input_source = g_unix_fd_add (STDIN_FILENO,
-                                    G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
-                                    confirm_finger,
-                                    &result);
-      g_main_loop_run (loop);
-      control.prompting = FALSE;
-      g_clear_handle_id (&input_source, g_source_remove);
+      if (mode == CAPTURE_MODE_MANUAL_FINGER)
+        {
+          g_print ("Background captured. Place one finger flat on the reader, "
+                   "then press Enter (Ctrl+C cancels): ");
+          fflush (stdout);
+          result.complete = FALSE;
+          control.prompting = TRUE;
+          input_source = g_unix_fd_add (STDIN_FILENO,
+                                        G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+                                        confirm_finger,
+                                        &result);
+          g_main_loop_run (loop);
+          control.prompting = FALSE;
+          g_clear_handle_id (&input_source, g_source_remove);
 
-      if (!result.error && g_cancellable_is_cancelled (cancellable))
-        result.error = g_error_new_literal (G_IO_ERROR,
-                                            G_IO_ERROR_CANCELLED,
-                                            "Capture cancelled");
+          if (!result.error && g_cancellable_is_cancelled (cancellable))
+            result.error = g_error_new_literal (G_IO_ERROR,
+                                                G_IO_ERROR_CANCELLED,
+                                                "Capture cancelled");
+        }
+      else
+        {
+          g_print ("Background captured. Waiting for a stable finger press "
+                   "(Ctrl+C cancels)...\n");
+        }
     }
 
-  if (!result.error && finger_mode)
+  if (!result.error && mode == CAPTURE_MODE_MANUAL_FINGER)
     {
       result.complete = FALSE;
       timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
@@ -301,6 +339,87 @@ main (int argc, char *argv[])
         g_assert_nonnull (result.error);
     }
 
+  if (!result.error && mode == CAPTURE_MODE_STABLE_PRESS)
+    {
+      result.complete = FALSE;
+      timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
+                                              cancel_capture,
+                                              &control);
+      ssm = mafp8800_fp36_acquire_press_new (
+        device,
+        spi_fd,
+        cancellable,
+        gain,
+        background,
+        MAFP8800_FP36_FRAME_SIZE,
+        frame,
+        MAFP8800_FP36_FRAME_SIZE,
+        &stable,
+        &changed_pixels,
+        &stability_sad);
+      g_assert_nonnull (ssm);
+      fpi_ssm_start (ssm, capture_complete_cb);
+      if (!result.complete)
+        g_main_loop_run (loop);
+      g_clear_handle_id (&timeout_source, g_source_remove);
+
+      if (!result.error && !stable)
+        {
+          result.error = g_error_new (
+            G_IO_ERROR,
+            G_IO_ERROR_FAILED,
+            "Finger did not become stable after %u comparisons "
+            "(changed=%u, SAD=%" G_GUINT64_FORMAT ")",
+            MAFP8800_FP36_STABILITY_ATTEMPTS,
+            changed_pixels,
+            stability_sad);
+        }
+
+      if (!result.error)
+        {
+          g_print ("Stable press accepted: changed=%u/%u SAD=%"
+                   G_GUINT64_FORMAT "/%u\n",
+                   changed_pixels,
+                   MAFP8800_FP36_ENHANCED_PIXELS,
+                   stability_sad,
+                   MAFP8800_FP36_STABLE_SAD_LIMIT);
+          if (!mafp8800_enhance_fp36_frame (
+                background,
+                MAFP8800_FP36_FRAME_SIZE,
+                frame,
+                MAFP8800_FP36_FRAME_SIZE,
+                enhanced,
+                MAFP8800_FP36_ENHANCED_PIXELS,
+                &result.error))
+            g_assert_nonnull (result.error);
+        }
+    }
+
+  if (!result.error && mode == CAPTURE_MODE_STABLE_PRESS)
+    {
+      g_print ("Lift the finger; waiting for removal debounce...\n");
+      result.complete = FALSE;
+      timeout_source = g_timeout_add_seconds (CAPTURE_TIMEOUT_SECONDS,
+                                              cancel_capture,
+                                              &control);
+      ssm = mafp8800_fp36_wait_removal_new (
+        device,
+        spi_fd,
+        cancellable,
+        gain,
+        background,
+        MAFP8800_FP36_FRAME_SIZE,
+        frame,
+        MAFP8800_FP36_FRAME_SIZE);
+      g_assert_nonnull (ssm);
+      fpi_ssm_start (ssm, capture_complete_cb);
+      if (!result.complete)
+        g_main_loop_run (loop);
+      g_clear_handle_id (&timeout_source, g_source_remove);
+      if (!result.error)
+        g_print ("Finger removal confirmed.\n");
+    }
+
   g_clear_handle_id (&signal_source, g_source_remove);
   g_clear_handle_id (&input_source, g_source_remove);
   g_clear_handle_id (&timeout_source, g_source_remove);
@@ -310,10 +429,11 @@ main (int argc, char *argv[])
     {
       g_printerr ("Capture failed: %s\n", result.error->message);
       g_clear_error (&result.error);
-      return 1;
+      exit_status = 1;
+      goto out;
     }
 
-  if (!(finger_mode ?
+  if (!(mode != CAPTURE_MODE_BACKGROUND ?
         write_pixels_pgm (argv[2],
                           enhanced,
                           MAFP8800_FP36_ENHANCED_COLUMNS,
@@ -322,9 +442,16 @@ main (int argc, char *argv[])
         write_raw_frame_pgm (argv[2], frame, &error)))
     {
       g_printerr ("Cannot write %s: %s\n", argv[2], error->message);
-      return 1;
+      exit_status = 1;
+      goto out;
     }
 
   g_print ("Wrote private 16-bit PGM to %s\n", argv[2]);
-  return 0;
+
+out:
+  clear_sensitive (frame, MAFP8800_FP36_FRAME_SIZE);
+  clear_sensitive (background, MAFP8800_FP36_FRAME_SIZE);
+  clear_sensitive (enhanced,
+                   MAFP8800_FP36_ENHANCED_PIXELS * sizeof (guint16));
+  return exit_status;
 }

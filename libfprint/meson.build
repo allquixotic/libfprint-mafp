@@ -124,6 +124,8 @@ driver_sources = {
     'elanspi' : files('drivers/elanspi.c'),
     'mafp8800' : files(
         'drivers/mafp8800.c',
+        'drivers/mafp8800-acquisition.c',
+        'drivers/mafp8800-press.c',
         'drivers/mafp8800-proto.c',
         'drivers/mafp8800-template.c',
         'drivers/mafp8800-transport.c',

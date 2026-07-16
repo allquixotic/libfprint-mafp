@@ -22,7 +22,7 @@
 typedef struct
 {
   GMainLoop *loop;
-  gint        expected_error;
+  gint       expected_error;
 } TransferTestData;
 
 typedef struct
@@ -33,14 +33,31 @@ typedef struct
   gboolean cancel_after_first;
 } TransferTestParams;
 
+typedef struct
+{
+  gsize length;
+  gsize transferred;
+  guint calls;
+} ConcurrentTransferState;
+
+typedef struct
+{
+  GMainLoop *loop;
+  guint      remaining;
+} ConcurrentResult;
+
 static gboolean ioctl_error;
 static guint ioctl_calls;
 static gsize expected_length;
 static gsize transferred_length;
 static gboolean cancel_after_first;
 static GCancellable *active_cancellable;
+static gboolean concurrent_mode;
+static ConcurrentTransferState concurrent_states[2];
 
-int __wrap_ioctl (int fd, unsigned long request, ...);
+int __wrap_ioctl (int           fd,
+                  unsigned long request,
+                  ...);
 
 int
 __wrap_ioctl (int fd, unsigned long request, ...)
@@ -53,6 +70,30 @@ __wrap_ioctl (int fd, unsigned long request, ...)
   va_start (args, request);
   xfer = va_arg (args, struct spi_ioc_transfer *);
   va_end (args);
+
+  if (concurrent_mode)
+    {
+      const guint index = fd - TEST_FD;
+      ConcurrentTransferState *state;
+
+      g_assert_cmpuint (index, <, G_N_ELEMENTS (concurrent_states));
+      state = &concurrent_states[index];
+      g_assert_cmpuint (request, ==, SPI_IOC_MESSAGE (1));
+      g_assert_nonnull (xfer);
+      g_assert_cmpuint (xfer[0].len, >, 0);
+      g_assert_cmpuint (xfer[0].tx_buf, !=, 0);
+      g_assert_cmpuint (xfer[0].rx_buf, !=, 0);
+      g_assert_cmpint (xfer[0].cs_change, ==,
+                       state->transferred + xfer[0].len < state->length);
+
+      buffer_wr = (guint8 *) (guintptr) xfer[0].tx_buf;
+      buffer_rd = (guint8 *) (guintptr) xfer[0].rx_buf;
+      for (guint i = 0; i < xfer[0].len; i++)
+        buffer_rd[i] = buffer_wr[i] ^ TEST_MASK;
+      state->calls++;
+      state->transferred += xfer[0].len;
+      return xfer[0].len;
+    }
 
   g_assert_cmpint (fd, ==, TEST_FD);
   g_assert_cmpuint (request, ==, SPI_IOC_MESSAGE (1));
@@ -83,6 +124,66 @@ __wrap_ioctl (int fd, unsigned long request, ...)
 }
 
 static void
+concurrent_done_cb (FpiSpiTransfer *transfer,
+                    FpDevice       *device,
+                    gpointer        user_data,
+                    GError         *error)
+{
+  ConcurrentResult *result = user_data;
+
+  g_assert_true (FP_IS_DEVICE (device));
+  g_assert_no_error (error);
+  for (gsize index = 0; index < transfer->length_rd; index++)
+    g_assert_cmphex (transfer->buffer_rd[index], ==,
+                     transfer->buffer_wr[index] ^ TEST_MASK);
+
+  g_assert_cmpuint (result->remaining, >, 0);
+  result->remaining--;
+  if (result->remaining == 0)
+    g_main_loop_quit (result->loop);
+}
+
+static void
+test_duplex_async_concurrent (void)
+{
+  const gsize length = (gsize) G_MAXUINT16 + 1;
+
+  g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
+  g_autoptr(GMainLoop) loop = g_main_loop_new (NULL, FALSE);
+  ConcurrentResult result = {
+    .loop = loop,
+    .remaining = G_N_ELEMENTS (concurrent_states),
+  };
+
+  memset (concurrent_states, 0, sizeof (concurrent_states));
+  concurrent_mode = TRUE;
+  for (guint index = 0; index < G_N_ELEMENTS (concurrent_states); index++)
+    {
+      FpiSpiTransfer *transfer =
+        fpi_spi_transfer_new (device, TEST_FD + index);
+
+      concurrent_states[index].length = length;
+      fpi_spi_transfer_duplex (transfer, length);
+      fpi_spi_transfer_submit (transfer,
+                               NULL,
+                               concurrent_done_cb,
+                               &result);
+    }
+
+  /* Each in-flight transfer, rather than its GTask worker, owns the device
+   * until the corresponding main-context callback has returned. */
+  g_clear_object (&device);
+  g_main_loop_run (loop);
+  concurrent_mode = FALSE;
+
+  for (guint index = 0; index < G_N_ELEMENTS (concurrent_states); index++)
+    {
+      g_assert_cmpuint (concurrent_states[index].calls, >, 1);
+      g_assert_cmpuint (concurrent_states[index].transferred, ==, length);
+    }
+}
+
+static void
 transfer_done_cb (FpiSpiTransfer *transfer,
                   FpDevice       *device,
                   gpointer        user_data,
@@ -94,7 +195,9 @@ transfer_done_cb (FpiSpiTransfer *transfer,
   g_assert_nonnull (transfer);
 
   if (data->expected_error >= 0)
-    g_assert_error (error, G_IO_ERROR, data->expected_error);
+    {
+      g_assert_error (error, G_IO_ERROR, data->expected_error);
+    }
   else
     {
       g_assert_no_error (error);
@@ -111,6 +214,7 @@ static void
 test_duplex_async (gconstpointer user_data)
 {
   const TransferTestParams *params = user_data;
+
   g_autoptr(FpDevice) device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
   g_autoptr(FpiSpiTransfer) transfer = NULL;
   g_autoptr(GCancellable) cancellable = g_cancellable_new ();
@@ -186,6 +290,8 @@ main (int argc, char *argv[])
   g_test_add_data_func ("/spi-transfer/duplex/async/cancel-between-chunks",
                         &cancel,
                         test_duplex_async);
+  g_test_add_func ("/spi-transfer/duplex/async/concurrent",
+                   test_duplex_async_concurrent);
 
   return g_test_run ();
 }

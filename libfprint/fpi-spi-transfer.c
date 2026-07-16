@@ -143,6 +143,7 @@ fpi_spi_transfer_free (FpiSpiTransfer *self)
 {
   g_assert (self);
   g_assert_cmpint (g_atomic_int_get (&self->ref_count), ==, 0);
+  g_assert_null (self->submitted_device);
 
   if (self->free_buffer_wr && self->buffer_wr)
     self->free_buffer_wr (self->buffer_wr);
@@ -345,6 +346,7 @@ transfer_finish_cb (GObject *source_object, GAsyncResult *res, gpointer user_dat
 
   g_autoptr(FpiSpiTransfer) transfer =
     fpi_spi_transfer_ref (g_task_get_task_data (task));
+  g_autoptr(FpDevice) submitted_device = NULL;
   GError *error = NULL;
   FpiSpiTransferCallback callback;
 
@@ -364,7 +366,9 @@ transfer_finish_cb (GObject *source_object, GAsyncResult *res, gpointer user_dat
   transfer->callback = NULL;
   g_atomic_int_set (&transfer->worker_complete, 0);
   g_atomic_int_set (&transfer->submitted, 0);
-  callback (transfer, transfer->device, transfer->user_data, error);
+  submitted_device = g_steal_pointer (&transfer->submitted_device);
+  g_assert_true (FP_IS_DEVICE (submitted_device));
+  callback (transfer, submitted_device, transfer->user_data, error);
 }
 
 static int
@@ -435,12 +439,12 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
    */
   if (full_length > *transferred + len)
     {
-      static gboolean warned = FALSE;
+      static gsize warned = 0;
 
-      if (!warned)
+      if (g_once_init_enter (&warned))
         {
           g_message ("Split SPI transfer. In case of issues, try increasing the spidev buffer size.");
-          warned = TRUE;
+          g_once_init_leave (&warned, 1);
         }
 
       xfer[transfers - 1].cs_change = TRUE;
@@ -569,13 +573,18 @@ fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
   transfer->user_data = user_data;
   g_assert_cmpint (g_atomic_int_get (&transfer->submitted), ==, 0);
   g_assert_cmpint (g_atomic_int_get (&transfer->worker_complete), ==, 0);
+  g_assert_null (transfer->submitted_device);
 
   log_transfer (transfer, TRUE, NULL);
 
-  task = g_task_new (transfer->device,
+  /* Keep the device alive explicitly until the main-context callback.  A
+   * GTask source-object reference may instead be released by its worker,
+   * which can race finalization immediately after the callback returns. */
+  task = g_task_new (NULL,
                      cancellable,
                      transfer_finish_cb,
                      NULL);
+  transfer->submitted_device = g_object_ref (transfer->device);
   /* Publish all initialized fields before handing ownership to GTask. */
   g_atomic_int_set (&transfer->submitted, 1);
   g_task_set_task_data (task,
@@ -603,6 +612,7 @@ fpi_spi_transfer_submit_sync (FpiSpiTransfer *transfer,
                               GError        **error)
 {
   g_autoptr(GTask) task = NULL;
+  g_autoptr(FpDevice) submitted_device = NULL;
   GError *err = NULL;
   gboolean res;
 
@@ -613,7 +623,8 @@ fpi_spi_transfer_submit_sync (FpiSpiTransfer *transfer,
 
   log_transfer (transfer, TRUE, NULL);
 
-  task = g_task_new (transfer->device,
+  submitted_device = g_object_ref (transfer->device);
+  task = g_task_new (NULL,
                      NULL,
                      NULL,
                      NULL);
