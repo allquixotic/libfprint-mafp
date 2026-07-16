@@ -16,8 +16,6 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "focaltech_moc.h"
-
 #include <ctype.h>
 
 #define FP_COMPONENT "focaltech_moc"
@@ -26,6 +24,7 @@
 #define FOCALTECH_MOC_STATIC_USER_ID "focaltech_moc_static_id"
 
 #include "drivers_api.h"
+#include "focaltech_moc.h"
 
 G_DEFINE_TYPE (FpiDeviceFocaltechMoc, fpi_device_focaltech_moc, FP_TYPE_DEVICE)
 
